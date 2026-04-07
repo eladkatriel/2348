@@ -74,21 +74,33 @@ def create_report(data):
     return buffer
 
 def process_item(item_id):
+    print("START process_item with item_id:", item_id)
+
     data = get_item_data(item_id)
+    print("ITEM DATA:", data)
 
     project_name = data.get("name", f"project_{item_id}")
     folder_path = f"/Projects/{project_name}"
     file_path = f"{folder_path}/Report.docx"
 
+    print("FOLDER PATH:", folder_path)
+    print("FILE PATH:", file_path)
+
     try:
         dbx.files_create_folder_v2(folder_path)
-    except Exception:
-        pass
+        print("FOLDER CREATED")
+    except Exception as e:
+        print("FOLDER CREATE SKIPPED OR FAILED:", str(e))
 
     report = create_report(data)
+    print("REPORT CREATED IN MEMORY")
+
     dbx.files_upload(report.read(), file_path, mode=dropbox.files.WriteMode.overwrite)
+    print("FILE UPLOADED TO DROPBOX")
 
     link = dbx.sharing_create_shared_link_with_settings(file_path).url
+    print("SHARE LINK CREATED:", link)
+
     return link
 
 @app.route("/", methods=["GET"])
@@ -101,11 +113,10 @@ def webhook():
         return "Webhook endpoint is live", 200
 
     data = request.get_json(silent=True) or {}
-
     print("INCOMING DATA:", data)
 
     if "challenge" in data:
-        return jsonify({"challenge": data["challenge"]})
+        return jsonify({"challenge": data["challenge"]}), 200
 
     try:
         item_id = (
@@ -115,13 +126,18 @@ def webhook():
             or data.get("itemId")
         )
 
+        print("ITEM ID:", item_id)
+
         if not item_id:
             return jsonify({"error": "No item id found", "payload": data}), 400
 
         link = process_item(int(item_id))
+        print("PROCESS SUCCESS. LINK:", link)
+
         return jsonify({"status": "success", "link": link}), 200
 
     except Exception as e:
+        print("PROCESS ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
