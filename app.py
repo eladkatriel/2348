@@ -53,7 +53,7 @@ def get_item_data(item_id):
     return cols
 
 def create_report(data):
-    template_path = "/Templates/Report_Template.docx"
+    template_path = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/ממצאים ראשוניים + כ.כמויות/Contractor_template.docx"
     _, res = dbx.files_download(template_path)
     doc = Document(io.BytesIO(res.content))
 
