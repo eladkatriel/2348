@@ -27,7 +27,7 @@ dbx = dropbox.Dropbox(DROPBOX_TOKEN)
 
 # ===== PATHS =====
 BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
-TEMPLATE_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/ממצאים ראשוניים + כ.כמויות/קבלן/Contractor_template.docx"
+TEMPLATE_PATH = "/YOE/Template/23-48/Contractor_template.docx"
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
@@ -127,32 +127,10 @@ def replace_text_in_tables(doc: Document, replacements: dict):
 
 
 def create_report(data: dict) -> io.BytesIO:
-    possible_template_paths = [
-        "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/ממצאים ראשוניים + כ.כמויות/Contractor_template.docx",
-        "/Template/ממצאים ראשוניים + כ.כמויות/Contractor_template.docx",
-        "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/Contractor_template.docx",
-    ]
+    print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
 
-    last_error = None
-    template_bytes = None
-    used_template_path = None
-
-    for path in possible_template_paths:
-        try:
-            print("TRYING TEMPLATE PATH:", path)
-            _, res = dbx.files_download(path)
-            template_bytes = res.content
-            used_template_path = path
-            print("TEMPLATE FOUND AT:", path)
-            break
-        except Exception as e:
-            print("TEMPLATE NOT FOUND AT:", path, str(e))
-            last_error = e
-
-    if template_bytes is None:
-        raise Exception(f"Template file not found in any tested path. Last error: {last_error}")
-
-    doc = Document(io.BytesIO(template_bytes))
+    _, res = dbx.files_download(TEMPLATE_PATH)
+    doc = Document(io.BytesIO(res.content))
 
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
@@ -162,7 +140,6 @@ def create_report(data: dict) -> io.BytesIO:
     replacements["{{City}}"] = data.get(CITY_COLUMN_ID, "") or ""
     replacements["{{ProjectName}}"] = data.get("name", "") or ""
 
-    print("USING TEMPLATE PATH:", used_template_path)
     print("REPLACEMENTS:", replacements)
 
     replace_text_in_paragraphs(doc, replacements)
