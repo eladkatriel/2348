@@ -26,8 +26,8 @@ if not DROPBOX_TOKEN:
 dbx = dropbox.Dropbox(DROPBOX_TOKEN)
 
 # ===== PATHS =====
-BASE_REPORTS_PATH = "All files/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
-TEMPLATE_PATH = "All files/Template/23-48/Contractor_template.docx"
+BASE_REPORTS_PATH = "/All files/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
+TEMPLATE_PATH = "/All files/Template/23-48/Contractor_template.docx"
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
