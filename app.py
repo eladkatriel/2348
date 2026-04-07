@@ -114,21 +114,54 @@ def get_or_create_shared_link(file_path: str) -> str:
     return link
 
 
-def replace_text_in_paragraphs(doc: Document, replacements: dict):
-    for p in doc.paragraphs:
-        for old, new in replacements.items():
-            if old in p.text:
-                p.text = p.text.replace(old, new)
+# ===== WORD REPLACEMENT =====
+def replace_in_paragraph(paragraph, replacements: dict):
+    if not paragraph.text:
+        return
+
+    full_text = "".join(run.text for run in paragraph.runs)
+    if not full_text:
+        return
+
+    new_text = full_text
+    changed = False
+
+    for old, new in replacements.items():
+        if old in new_text:
+            new_text = new_text.replace(old, str(new))
+            changed = True
+
+    if not changed:
+        return
+
+    # שומרים את כל הטקסט ב-run הראשון ומרוקנים את היתר
+    paragraph.runs[0].text = new_text
+    for run in paragraph.runs[1:]:
+        run.text = ""
 
 
-def replace_text_in_tables(doc: Document, replacements: dict):
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    for old, new in replacements.items():
-                        if old in p.text:
-                            p.text = p.text.replace(old, new)
+def replace_in_table(table, replacements: dict):
+    for row in table.rows:
+        for cell in row.cells:
+            replace_in_document_parts(cell, replacements)
+
+
+def replace_in_document_parts(container, replacements: dict):
+    for paragraph in container.paragraphs:
+        replace_in_paragraph(paragraph, replacements)
+
+    for table in container.tables:
+        replace_in_table(table, replacements)
+
+
+def replace_everywhere(doc: Document, replacements: dict):
+    # גוף המסמך
+    replace_in_document_parts(doc, replacements)
+
+    # Header / Footer
+    for section in doc.sections:
+        replace_in_document_parts(section.header, replacements)
+        replace_in_document_parts(section.footer, replacements)
 
 
 # ===== DOCUMENT CREATION =====
@@ -148,8 +181,7 @@ def create_report(data: dict) -> io.BytesIO:
 
     print("REPLACEMENTS:", replacements)
 
-    replace_text_in_paragraphs(doc, replacements)
-    replace_text_in_tables(doc, replacements)
+    replace_everywhere(doc, replacements)
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -181,8 +213,6 @@ def process_item(item_id: int):
     street = (data.get("text_mm12vcy9", "") or "").strip()
     number = (data.get("text_mm12jf0w", "") or "").strip()
     apartment = (data.get("text_mm127a33", "") or "").strip()
-
-    # אם תרצי להשתמש בתאריך אחר בשם הקובץ, החליפי לשדה אחר כאן
     report_date = (data.get("dup__of_90__timeline", "") or "").strip()
 
     file_name = sanitize_filename(
