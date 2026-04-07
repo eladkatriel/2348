@@ -84,13 +84,19 @@ def get_item_data(item_id: int):
     return cols
 
 
-# ===== DROPBOX HELPERS =====
+# ===== HELPERS =====
+def sanitize_filename(name: str) -> str:
+    invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+    for ch in invalid_chars:
+        name = name.replace(ch, "-")
+    return " ".join(name.split()).strip()
+
+
 def create_folder_if_needed(folder_path: str):
     try:
         dbx.files_create_folder_v2(folder_path)
         print("FOLDER CREATED:", folder_path)
     except Exception as e:
-        # אם התיקייה כבר קיימת, זו לא שגיאה מבחינתנו
         print("FOLDER CREATE SKIPPED OR FAILED:", folder_path, str(e))
 
 
@@ -108,7 +114,6 @@ def get_or_create_shared_link(file_path: str) -> str:
     return link
 
 
-# ===== DOCUMENT CREATION =====
 def replace_text_in_paragraphs(doc: Document, replacements: dict):
     for p in doc.paragraphs:
         for old, new in replacements.items():
@@ -126,6 +131,7 @@ def replace_text_in_tables(doc: Document, replacements: dict):
                             p.text = p.text.replace(old, new)
 
 
+# ===== DOCUMENT CREATION =====
 def create_report(data: dict) -> io.BytesIO:
     print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
 
@@ -171,20 +177,31 @@ def process_item(item_id: int):
     report_folder = f"{BASE_REPORTS_PATH}/{city_name}/{project_name}"
     photos_folder = f"{report_folder}/תמונות"
     findings_folder = f"{report_folder}/ממצאים ראשוניים + כ.כמויות"
-    file_path = f"{findings_folder}/Report.docx"
+
+    street = (data.get("text_mm12vcy9", "") or "").strip()
+    number = (data.get("text_mm12jf0w", "") or "").strip()
+    apartment = (data.get("text_mm127a33", "") or "").strip()
+
+    # אם תרצי להשתמש בתאריך אחר בשם הקובץ, החליפי לשדה אחר כאן
+    report_date = (data.get("dup__of_90__timeline", "") or "").strip()
+
+    file_name = sanitize_filename(
+        f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
+        f"דירה {apartment}- {city_name}, {report_date}.docx"
+    )
+
+    file_path = f"{findings_folder}/{file_name}"
 
     print("REPORT FOLDER:", report_folder)
     print("PHOTOS FOLDER:", photos_folder)
     print("FINDINGS FOLDER:", findings_folder)
     print("FILE PATH:", file_path)
 
-    # יצירת מבנה התיקיות
     create_folder_if_needed(f"{BASE_REPORTS_PATH}/{city_name}")
     create_folder_if_needed(report_folder)
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
 
-    # יצירת דו"ח
     report = create_report(data)
 
     dbx.files_upload(
@@ -214,7 +231,6 @@ def webhook():
     data = request.get_json(silent=True) or {}
     print("INCOMING DATA:", data)
 
-    # monday webhook URL verification
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]}), 200
 
