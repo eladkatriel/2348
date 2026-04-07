@@ -102,6 +102,8 @@ def webhook():
 
     data = request.get_json(silent=True) or {}
 
+    print("INCOMING DATA:", data)
+
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
