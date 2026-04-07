@@ -27,7 +27,7 @@ dbx = dropbox.Dropbox(DROPBOX_TOKEN)
 
 # ===== PATHS =====
 BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
-TEMPLATE_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/ממצאים ראשוניים + כ.כמויות/Contractor_template.docx"
+TEMPLATE_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי/Template/ממצאים ראשוניים + כ.כמויות/קבלן/Contractor_template.docx"
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
