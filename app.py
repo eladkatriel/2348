@@ -6,6 +6,7 @@ from datetime import datetime
 
 import requests
 import dropbox
+from dropbox.common import PathRoot
 from flask import Flask, request, jsonify
 from docx import Document
 
@@ -23,39 +24,24 @@ DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
 # Optional fallback for short-lived token during migration/testing
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-# monday Link column ID
+# monday column ids
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
+FILES_COLUMN_ID = "FILES"
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
-if DROPBOX_REFRESH_TOKEN:
-    if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-        raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
-    dbx = dropbox.Dropbox(
-        oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
-        app_key=DROPBOX_APP_KEY,
-        app_secret=DROPBOX_APP_SECRET,
-        timeout=120,
-    )
-    print("Dropbox client initialized with refresh token")
-elif DROPBOX_TOKEN:
-    dbx = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
-    print("Dropbox client initialized with access token")
-else:
-    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
-
 # ===== PATHS =====
-BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
+TARGET_SHARED_FOLDER_NAME = "חרבות ברזל 2023"
+BASE_REPORTS_PATH = "/20260228 - שאגת הארי"
 TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
-FILES_COLUMN_ID = "FILES"
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -71,6 +57,63 @@ COLUMN_MAP = {
     "{{Case}}": CASE_COLUMN_ID,
     "{{ID}}": ID_COLUMN_ID,
 }
+
+
+# ===== DROPBOX INIT WITH AUTO NAMESPACE =====
+def init_dropbox_with_auto_namespace():
+    if DROPBOX_REFRESH_TOKEN:
+        if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+            app_key=DROPBOX_APP_KEY,
+            app_secret=DROPBOX_APP_SECRET,
+            timeout=120,
+        )
+        print("Dropbox initialized with refresh token")
+    elif DROPBOX_TOKEN:
+        dbx = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
+        print("Dropbox initialized with access token")
+    else:
+        raise ValueError(
+            "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
+        )
+
+    # auto-detect shared-folder namespace at root
+    try:
+        result = dbx.files_list_folder("")
+        for entry in result.entries:
+            if entry.name == TARGET_SHARED_FOLDER_NAME and getattr(entry, "id", "").startswith("id:") is False:
+                # shared folder entries at root are often namespace-backed and can expose ns: ids
+                entry_id = getattr(entry, "id", "")
+                print("ROOT ENTRY:", entry.name, entry_id)
+                if entry_id.startswith("ns:"):
+                    namespace_id = entry_id.replace("ns:", "")
+                    dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
+                    print("Using auto-detected namespace:", namespace_id)
+                    return dbx
+
+        # fallback: search mounted shared folders
+        try:
+            shared = dbx.sharing_list_folders()
+            for folder in shared.entries:
+                if folder.name == TARGET_SHARED_FOLDER_NAME:
+                    namespace_id = str(folder.shared_folder_id)
+                    print("Found shared folder by sharing_list_folders, shared_folder_id:", namespace_id)
+                    # keep default root if we couldn't get a namespace id
+                    break
+        except Exception as e:
+            print("sharing_list_folders lookup skipped/failed:", str(e))
+
+        print("Shared namespace not auto-detected; using default root")
+        return dbx
+
+    except Exception as e:
+        print("Auto namespace detection failed; using default root:", str(e))
+        return dbx
+
+
+dbx = init_dropbox_with_auto_namespace()
 
 
 # ===== MONDAY API =====
@@ -252,9 +295,6 @@ def replace_in_paragraph(paragraph, replacements: dict):
     for run in paragraph.runs[1:]:
         run.text = ""
 
-res = dbx.files_list_folder("")
-for e in res.entries:
-    print(e.name, e.id)
 
 def replace_in_table(table, replacements: dict):
     for row in table.rows:
@@ -346,7 +386,6 @@ def process_item(item_id: int):
     print("FINDINGS FOLDER:", findings_folder)
     print("FILE PATH:", file_path)
 
-    create_folder_if_needed(f"{BASE_REPORTS_PATH}/{city_name}")
     create_folder_if_needed(report_folder)
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
