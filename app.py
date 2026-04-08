@@ -252,6 +252,9 @@ def replace_in_paragraph(paragraph, replacements: dict):
     for run in paragraph.runs[1:]:
         run.text = ""
 
+res = dbx.files_list_folder("")
+for e in res.entries:
+    print(e.name, e.id)
 
 def replace_in_table(table, replacements: dict):
     for row in table.rows:
