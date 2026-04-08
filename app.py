@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import json
 from datetime import datetime
 
 import requests
@@ -13,6 +15,10 @@ app = Flask(__name__)
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
+
+# Optional: if you want to also write the Dropbox share link back to a monday Link column,
+# set LINK_COLUMN_ID in Render environment variables.
+LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "").strip()
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
@@ -31,6 +37,9 @@ TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
+CASE_COLUMN_ID = "text_mm12qp1q"
+ID_COLUMN_ID = "text_mm12vayb"
+FILES_COLUMN_ID = "files"
 
 # ===== PLACEHOLDER -> MONDAY COLUMN MAP =====
 COLUMN_MAP = {
@@ -39,39 +48,47 @@ COLUMN_MAP = {
     "{{Number}}": "text_mm12jf0w",
     "{{Apartment}}": "text_mm127a33",
     "{{Hit date}}": "date_mm1rnmvg",
-    "{{Date}}": "dup__of_90__timeline",
     "{{months}}": "text_mm129ef8",
+    "{{City}}": CITY_COLUMN_ID,
+    "{{Case}}": CASE_COLUMN_ID,
+    "{{ID}}": ID_COLUMN_ID,
 }
 
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
 # ===== MONDAY API =====
-def monday_query(query: str):
+def monday_query(query: str, variables: dict | None = None):
     response = requests.post(
         "https://api.monday.com/v2",
-        json={"query": query},
+        json={"query": query, "variables": variables or {}},
         headers={
             "Authorization": MONDAY_API_KEY,
             "Content-Type": "application/json",
         },
-        timeout=30,
+        timeout=60,
     )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    if "errors" in payload:
+        raise Exception(f"monday API error: {payload['errors']}")
+    return payload
 
 
 def get_item_data(item_id: int):
-    query = f"""
-    query {{
-      items(ids: [{item_id}]) {{
+    query = """
+    query ($item_ids: [ID!]) {
+      items(ids: $item_ids) {
+        id
         name
-        column_values {{
+        column_values {
           id
           text
-        }}
-      }}
-    }}
+        }
+      }
+    }
     """
-
-    data = monday_query(query)
+    data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
 
     if not items:
@@ -80,8 +97,64 @@ def get_item_data(item_id: int):
     item = items[0]
     cols = {c["id"]: c.get("text", "") for c in item["column_values"]}
     cols["name"] = item["name"]
+    cols["item_id"] = str(item["id"])
 
     return cols
+
+
+def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
+    query = """
+    mutation ($item_id: ID!, $column_id: String!, $file: File!) {
+      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+        id
+      }
+    }
+    """
+    data = {
+        "query": query,
+        "variables": json.dumps({
+            "item_id": str(item_id),
+            "column_id": column_id,
+        }),
+    }
+    files = {
+        "variables[file]": (file_name, file_bytes, DOCX_MIME),
+    }
+    response = requests.post(
+        "https://api.monday.com/v2/file",
+        headers={"Authorization": MONDAY_API_KEY},
+        data=data,
+        files=files,
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if "errors" in payload:
+        raise Exception(f"monday file upload error: {payload['errors']}")
+    return payload
+
+
+def update_link_column(item_id: int, column_id: str, url: str, text: str):
+    if not column_id:
+        return
+
+    value = json.dumps({"url": url, "text": text})
+    query = """
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
+    }
+    """
+    monday_query(
+        query,
+        {
+            "board_id": str(BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": value,
+        },
+    )
 
 
 # ===== HELPERS =====
@@ -114,6 +187,13 @@ def get_or_create_shared_link(file_path: str) -> str:
     return link
 
 
+def extract_first_date(value: str) -> str:
+    if not value:
+        return ""
+    match = re.search(r"\d{4}-\d{2}-\d{2}", value)
+    return match.group(0) if match else value.strip()
+
+
 # ===== WORD REPLACEMENT =====
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
@@ -134,7 +214,6 @@ def replace_in_paragraph(paragraph, replacements: dict):
     if not changed:
         return
 
-    # שומרים את כל הטקסט ב-run הראשון ומרוקנים את היתר
     paragraph.runs[0].text = new_text
     for run in paragraph.runs[1:]:
         run.text = ""
@@ -155,40 +234,47 @@ def replace_in_document_parts(container, replacements: dict):
 
 
 def replace_everywhere(doc: Document, replacements: dict):
-    # גוף המסמך
     replace_in_document_parts(doc, replacements)
-
-    # Header / Footer
     for section in doc.sections:
         replace_in_document_parts(section.header, replacements)
         replace_in_document_parts(section.footer, replacements)
 
 
 # ===== DOCUMENT CREATION =====
-def create_report(data: dict) -> io.BytesIO:
+def build_replacements(data: dict) -> dict:
+    replacements = {}
+
+    for placeholder, col_id in COLUMN_MAP.items():
+        replacements[placeholder] = data.get(col_id, "") or ""
+
+    first_date = extract_first_date(
+        (data.get("dup__of_90__timeline", "") or "").strip()
+    ) or (data.get("date_mm1rnmvg", "") or "").strip()
+
+    replacements["{{Date}}"] = first_date
+    replacements["{{date_today}}"] = datetime.now().strftime("%d/%m/%Y")
+    replacements["{{ProjectName}}"] = data.get("name", "") or ""
+
+    return replacements
+
+
+def create_report(data: dict) -> tuple[bytes, dict]:
     print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
 
     _, res = dbx.files_download(TEMPLATE_PATH)
     doc = Document(io.BytesIO(res.content))
 
-    replacements = {}
-    for placeholder, col_id in COLUMN_MAP.items():
-        replacements[placeholder] = data.get(col_id, "") or ""
-
-    replacements["{{date_today}}"] = datetime.now().strftime("%d/%m/%Y")
-    replacements["{{City}}"] = data.get(CITY_COLUMN_ID, "") or ""
-    replacements["{{ProjectName}}"] = data.get("name", "") or ""
-
+    replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
 
     replace_everywhere(doc, replacements)
 
     buffer = io.BytesIO()
     doc.save(buffer)
-    buffer.seek(0)
+    report_bytes = buffer.getvalue()
 
     print("REPORT CREATED IN MEMORY")
-    return buffer
+    return report_bytes, replacements
 
 
 # ===== MAIN PROCESS =====
@@ -198,11 +284,9 @@ def process_item(item_id: int):
     data = get_item_data(item_id)
     print("ITEM DATA:", data)
 
-    project_name = (data.get("name", "") or "").strip()
-    if not project_name:
-        project_name = f"project_{item_id}"
-
+    project_name = (data.get("name", "") or "").strip() or f"project_{item_id}"
     city_name = (data.get(CITY_COLUMN_ID, "") or "").strip()
+
     if not city_name:
         raise Exception(f"City field is empty or missing (column id: {CITY_COLUMN_ID})")
 
@@ -213,7 +297,9 @@ def process_item(item_id: int):
     street = (data.get("text_mm12vcy9", "") or "").strip()
     number = (data.get("text_mm12jf0w", "") or "").strip()
     apartment = (data.get("text_mm127a33", "") or "").strip()
-    report_date = (data.get("dup__of_90__timeline", "") or "").strip()
+    report_date = extract_first_date(
+        (data.get("dup__of_90__timeline", "") or "").strip()
+    ) or (data.get("date_mm1rnmvg", "") or "").strip()
 
     file_name = sanitize_filename(
         f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
@@ -232,19 +318,45 @@ def process_item(item_id: int):
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
 
-    report = create_report(data)
+    report_bytes, replacements = create_report(data)
 
     dbx.files_upload(
-        report.read(),
+        report_bytes,
         file_path,
-        mode=dropbox.files.WriteMode.overwrite
+        mode=dropbox.files.WriteMode.overwrite,
+        mute=True,
     )
     print("FILE UPLOADED TO DROPBOX")
 
     link = get_or_create_shared_link(file_path)
+
+    # Supported/API-safe behavior:
+    # Upload the generated file itself into monday Files column.
+    upload_file_to_monday(
+        item_id=item_id,
+        column_id=FILES_COLUMN_ID,
+        file_name=file_name,
+        file_bytes=report_bytes,
+    )
+    print("FILE UPLOADED TO MONDAY FILES COLUMN")
+
+    # Optional: also write the Dropbox share link into a Link column if configured.
+    if LINK_COLUMN_ID:
+        update_link_column(
+            item_id=item_id,
+            column_id=LINK_COLUMN_ID,
+            url=link,
+            text=file_name,
+        )
+        print("DROPBOX LINK WRITTEN TO MONDAY LINK COLUMN")
+
     print("PROCESS SUCCESS. LINK:", link)
 
-    return link
+    return {
+        "link": link,
+        "file_name": file_name,
+        "replacements": replacements,
+    }
 
 
 # ===== ROUTES =====
@@ -277,8 +389,8 @@ def webhook():
         if not item_id:
             return jsonify({"error": "No item id found", "payload": data}), 400
 
-        link = process_item(int(item_id))
-        return jsonify({"status": "success", "link": link}), 200
+        result = process_item(int(item_id))
+        return jsonify({"status": "success", **result}), 200
 
     except Exception as e:
         print("PROCESS ERROR:", str(e))
