@@ -6,14 +6,13 @@ from datetime import datetime
 
 import requests
 import dropbox
+from dropbox.common import PathRoot
 from flask import Flask, request, jsonify
 from docx import Document
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
+# ===== CONFIG =====
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 
@@ -30,18 +29,21 @@ if not MONDAY_API_KEY:
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
-# =========================
-# HARD-LOCKED SHARED FOLDER PATHS
-# This version only works inside the required shared folder tree.
-# It fails fast if the Dropbox credentials cannot see these exact paths.
-# =========================
-SHARED_ROOT_PATH = "/YOE/חרבות ברזל 2023"
-BASE_REPORTS_PATH = f"{SHARED_ROOT_PATH}/20260228 - שאגת הארי"
-TEMPLATE_DIR = f"{SHARED_ROOT_PATH}/Template/23-48"
+# ===== DROPBOX TARGETS =====
+TARGET_SHARED_FOLDER_NAME = "חרבות ברזל 2023"
 
-# =========================
-# COLUMN IDS
-# =========================
+# The app will try these paths in order and use the first one that already exists.
+BASE_PATH_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי",
+    "/20260228 - שאגת הארי",
+]
+
+TEMPLATE_DIR_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/Template/23-48",
+    "/Template/23-48",
+]
+
+# ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
@@ -61,15 +63,11 @@ COLUMN_MAP = {
     "{{ID}}": ID_COLUMN_ID,
 }
 
-# =========================
-# DROPBOX
-# =========================
+
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-            raise ValueError(
-                "Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET"
-            )
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
         dbx = dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=DROPBOX_APP_KEY,
@@ -77,19 +75,36 @@ def init_dropbox():
             timeout=120,
         )
         print("Dropbox initialized with refresh token")
-        return dbx
-
-    if DROPBOX_TOKEN:
+    elif DROPBOX_TOKEN:
         dbx = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
         print("Dropbox initialized with access token")
-        return dbx
+    else:
+        raise ValueError(
+            "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
+        )
+    return dbx
 
-    raise ValueError(
-        "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
-    )
+
+def maybe_attach_shared_namespace(dbx):
+    try:
+        result = dbx.files_list_folder("")
+        for entry in result.entries:
+            entry_name = getattr(entry, "name", "")
+            entry_id = getattr(entry, "id", "")
+            print("ROOT ENTRY:", entry_name, entry_id)
+            if entry_name == TARGET_SHARED_FOLDER_NAME and entry_id.startswith("ns:"):
+                namespace_id = entry_id.replace("ns:", "")
+                dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
+                print("Using auto-detected namespace:", namespace_id)
+                return dbx
+    except Exception as e:
+        print("Auto namespace detection failed; using default root:", str(e))
+
+    print("Shared namespace not auto-detected; using default root")
+    return dbx
 
 
-dbx = init_dropbox()
+dbx = maybe_attach_shared_namespace(init_dropbox())
 
 
 def path_exists(path: str) -> bool:
@@ -101,26 +116,26 @@ def path_exists(path: str) -> bool:
         return False
 
 
-def validate_shared_paths():
-    required_paths = [
-        SHARED_ROOT_PATH,
-        BASE_REPORTS_PATH,
-        TEMPLATE_DIR,
-    ]
-    missing = [p for p in required_paths if not path_exists(p)]
-    if missing:
-        raise Exception(
-            "Shared folder path is not accessible with current Dropbox credentials. "
-            "Missing paths: " + " | ".join(missing)
-        )
-    print("Shared folder paths validated successfully")
+def resolve_existing_base_path() -> str:
+    for path in BASE_PATH_CANDIDATES:
+        if path_exists(path):
+            print("RESOLVED BASE REPORTS PATH:", path)
+            return path
+    raise Exception("Could not resolve reports base path. Checked: " + " | ".join(BASE_PATH_CANDIDATES))
 
 
-validate_shared_paths()
+def resolve_existing_template_dir() -> str:
+    for path in TEMPLATE_DIR_CANDIDATES:
+        if path_exists(path):
+            print("RESOLVED TEMPLATE DIR:", path)
+            return path
+    raise Exception("Could not resolve template directory. Checked: " + " | ".join(TEMPLATE_DIR_CANDIDATES))
 
-# =========================
-# MONDAY
-# =========================
+
+BASE_REPORTS_PATH = resolve_existing_base_path()
+TEMPLATE_DIR = resolve_existing_template_dir()
+
+
 def monday_query(query: str, variables: dict | None = None):
     response = requests.post(
         "https://api.monday.com/v2",
@@ -223,6 +238,8 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
     }
     """
 
+    print("UPDATING LINK COLUMN:", column_id, "WITH URL:", url)
+
     result = monday_query(
         query,
         {
@@ -235,9 +252,6 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
     return result
 
 
-# =========================
-# HELPERS
-# =========================
 def sanitize_filename(name: str) -> str:
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for ch in invalid_chars:
@@ -275,6 +289,13 @@ def extract_first_date(value: str) -> str:
 
 
 def resolve_template_filename(report_type_value: str) -> str:
+    """
+    Mapping by monday column color_mm12nfzt text value:
+    קבלן => Contractor_template.docx
+    מהנדס => Engineer_template.docx
+    להריסה => Engineer_template.docx
+    נזק ישן, אין פינוי ואין פיצוי => Contractor_template.docx
+    """
     value = (report_type_value or "").strip()
 
     mapping = {
@@ -293,16 +314,10 @@ def resolve_template_filename(report_type_value: str) -> str:
 def build_template_path(report_type_value: str) -> str:
     template_filename = resolve_template_filename(report_type_value)
     template_path = f"{TEMPLATE_DIR}/{template_filename}"
-
-    if not path_exists(template_path):
-        raise Exception(f"Template not found at expected shared-folder path: {template_path}")
-
     print("TEMPLATE PATH:", template_path)
     return template_path
 
-# =========================
-# WORD
-# =========================
+
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -313,7 +328,6 @@ def replace_in_paragraph(paragraph, replacements: dict):
 
     new_text = full_text
     changed = False
-
     for old, new in replacements.items():
         if old in new_text:
             new_text = new_text.replace(old, str(new))
@@ -349,7 +363,6 @@ def replace_everywhere(doc: Document, replacements: dict):
 
 def build_replacements(data: dict) -> dict:
     replacements = {}
-
     for placeholder, col_id in COLUMN_MAP.items():
         replacements[placeholder] = data.get(col_id, "") or ""
 
@@ -384,12 +397,8 @@ def create_report(data: dict):
     return report_bytes, replacements
 
 
-# =========================
-# MAIN
-# =========================
 def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
-
     data = get_item_data(item_id)
     print("ITEM DATA:", data)
 
@@ -415,7 +424,6 @@ def process_item(item_id: int):
     )
     file_path = f"{findings_folder}/{file_name}"
 
-    print("SHARED_ROOT_PATH:", SHARED_ROOT_PATH)
     print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
     print("TEMPLATE_DIR:", TEMPLATE_DIR)
     print("REPORT FOLDER:", report_folder)
@@ -466,9 +474,6 @@ def process_item(item_id: int):
     }
 
 
-# =========================
-# ROUTES
-# =========================
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
