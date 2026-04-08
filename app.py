@@ -16,9 +16,8 @@ MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-# Optional: if you want to also write the Dropbox share link back to a monday Link column,
-# set LINK_COLUMN_ID in Render environment variables.
-LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "").strip()
+# Optional link column. Default set to your monday Link column.
+LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
@@ -330,8 +329,6 @@ def process_item(item_id: int):
 
     link = get_or_create_shared_link(file_path)
 
-    # Supported/API-safe behavior:
-    # Upload the generated file itself into monday Files column.
     upload_file_to_monday(
         item_id=item_id,
         column_id=FILES_COLUMN_ID,
@@ -340,7 +337,6 @@ def process_item(item_id: int):
     )
     print("FILE UPLOADED TO MONDAY FILES COLUMN")
 
-    # Optional: also write the Dropbox share link into a Link column if configured.
     if LINK_COLUMN_ID:
         update_link_column(
             item_id=item_id,
