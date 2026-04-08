@@ -16,7 +16,7 @@ MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-# Optional link column. Default set to your monday Link column.
+# monday Link column ID
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 
 if not MONDAY_API_KEY:
@@ -38,7 +38,9 @@ TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
-FILES_COLUMN_ID = "files"
+FILES_COLUMN_ID = "FILES"   # per your monday column id
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 # ===== PLACEHOLDER -> MONDAY COLUMN MAP =====
 COLUMN_MAP = {
@@ -53,8 +55,6 @@ COLUMN_MAP = {
     "{{ID}}": ID_COLUMN_ID,
 }
 
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-
 
 # ===== MONDAY API =====
 def monday_query(query: str, variables: dict | None = None):
@@ -64,6 +64,7 @@ def monday_query(query: str, variables: dict | None = None):
         headers={
             "Authorization": MONDAY_API_KEY,
             "Content-Type": "application/json",
+            "API-Version": "2026-04",
         },
         timeout=60,
     )
@@ -97,7 +98,6 @@ def get_item_data(item_id: int):
     cols = {c["id"]: c.get("text", "") for c in item["column_values"]}
     cols["name"] = item["name"]
     cols["item_id"] = str(item["id"])
-
     return cols
 
 
@@ -121,7 +121,10 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
     }
     response = requests.post(
         "https://api.monday.com/v2/file",
-        headers={"Authorization": MONDAY_API_KEY},
+        headers={
+            "Authorization": MONDAY_API_KEY,
+            "API-Version": "2026-04",
+        },
         data=data,
         files=files,
         timeout=120,
@@ -134,26 +137,45 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
 
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
+    """
+    Writes a monday Link column using change_multiple_column_values, which is
+    generally the most reliable method for JSON-formatted column values.
+    """
     if not column_id:
+        print("LINK COLUMN ID IS EMPTY - SKIPPING LINK UPDATE")
         return
 
-    value = json.dumps({"url": url, "text": text})
+    column_values = json.dumps({
+        column_id: {
+            "url": url,
+            "text": text,
+        }
+    })
+
     query = """
-    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
-      change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+    mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
+      change_multiple_column_values(
+        board_id: $board_id,
+        item_id: $item_id,
+        column_values: $column_values
+      ) {
         id
       }
     }
     """
-    monday_query(
+
+    print("UPDATING LINK COLUMN:", column_id, "WITH URL:", url)
+
+    result = monday_query(
         query,
         {
             "board_id": str(BOARD_ID),
             "item_id": str(item_id),
-            "column_id": column_id,
-            "value": value,
+            "column_values": column_values,
         },
     )
+    print("LINK COLUMN UPDATE RESULT:", result)
+    return result
 
 
 # ===== HELPERS =====
@@ -227,7 +249,6 @@ def replace_in_table(table, replacements: dict):
 def replace_in_document_parts(container, replacements: dict):
     for paragraph in container.paragraphs:
         replace_in_paragraph(paragraph, replacements)
-
     for table in container.tables:
         replace_in_table(table, replacements)
 
@@ -253,13 +274,11 @@ def build_replacements(data: dict) -> dict:
     replacements["{{Date}}"] = first_date
     replacements["{{date_today}}"] = datetime.now().strftime("%d/%m/%Y")
     replacements["{{ProjectName}}"] = data.get("name", "") or ""
-
     return replacements
 
 
 def create_report(data: dict) -> tuple[bytes, dict]:
     print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
-
     _, res = dbx.files_download(TEMPLATE_PATH)
     doc = Document(io.BytesIO(res.content))
 
@@ -304,7 +323,6 @@ def process_item(item_id: int):
         f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
         f"דירה {apartment}- {city_name}, {report_date}.docx"
     )
-
     file_path = f"{findings_folder}/{file_name}"
 
     print("REPORT FOLDER:", report_folder)
@@ -337,17 +355,15 @@ def process_item(item_id: int):
     )
     print("FILE UPLOADED TO MONDAY FILES COLUMN")
 
-    if LINK_COLUMN_ID:
-        update_link_column(
-            item_id=item_id,
-            column_id=LINK_COLUMN_ID,
-            url=link,
-            text=file_name,
-        )
-        print("DROPBOX LINK WRITTEN TO MONDAY LINK COLUMN")
+    update_link_column(
+        item_id=item_id,
+        column_id=LINK_COLUMN_ID,
+        url=link,
+        text=file_name,
+    )
+    print("DROPBOX LINK WRITTEN TO MONDAY LINK COLUMN")
 
     print("PROCESS SUCCESS. LINK:", link)
-
     return {
         "link": link,
         "file_name": file_name,
