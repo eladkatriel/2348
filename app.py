@@ -38,15 +38,16 @@ BASE_PATH_CANDIDATES = [
     "/20260228 - שאגת הארי",
 ]
 
-TEMPLATE_PATH_CANDIDATES = [
-    "/YOE/חרבות ברזל 2023/Template/23-48/Contractor_template.docx",
-    "/Template/23-48/Contractor_template.docx",
+TEMPLATE_DIR_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/Template/23-48",
+    "/Template/23-48",
 ]
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
+REPORT_TYPE_COLUMN_ID = "color_mm12nfzt"   # קבלן/מהנדס/הריסה
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -123,16 +124,16 @@ def resolve_existing_base_path() -> str:
     raise Exception("Could not resolve reports base path. Checked: " + " | ".join(BASE_PATH_CANDIDATES))
 
 
-def resolve_existing_template_path() -> str:
-    for path in TEMPLATE_PATH_CANDIDATES:
+def resolve_existing_template_dir() -> str:
+    for path in TEMPLATE_DIR_CANDIDATES:
         if path_exists(path):
-            print("RESOLVED TEMPLATE PATH:", path)
+            print("RESOLVED TEMPLATE DIR:", path)
             return path
-    raise Exception("Could not resolve template path. Checked: " + " | ".join(TEMPLATE_PATH_CANDIDATES))
+    raise Exception("Could not resolve template directory. Checked: " + " | ".join(TEMPLATE_DIR_CANDIDATES))
 
 
 BASE_REPORTS_PATH = resolve_existing_base_path()
-TEMPLATE_PATH = resolve_existing_template_path()
+TEMPLATE_DIR = resolve_existing_template_dir()
 
 
 def monday_query(query: str, variables: dict | None = None):
@@ -287,6 +288,36 @@ def extract_first_date(value: str) -> str:
     return match.group(0) if match else value.strip()
 
 
+def resolve_template_filename(report_type_value: str) -> str:
+    """
+    Mapping by monday column color_mm12nfzt text value:
+    קבלן => Contractor_template.docx
+    מהנדס => Engineer_template.docx
+    להריסה => Engineer_template.docx
+    נזק ישן, אין פינוי ואין פיצוי => Contractor_template.docx
+    """
+    value = (report_type_value or "").strip()
+
+    mapping = {
+        "קבלן": "Contractor_template.docx",
+        "מהנדס": "Engineer_template.docx",
+        "להריסה": "Engineer_template.docx",
+        "נזק ישן, אין פינוי ואין פיצוי": "Contractor_template.docx",
+    }
+
+    selected = mapping.get(value, "Contractor_template.docx")
+    print("REPORT TYPE VALUE:", value)
+    print("SELECTED TEMPLATE FILE:", selected)
+    return selected
+
+
+def build_template_path(report_type_value: str) -> str:
+    template_filename = resolve_template_filename(report_type_value)
+    template_path = f"{TEMPLATE_DIR}/{template_filename}"
+    print("TEMPLATE PATH:", template_path)
+    return template_path
+
+
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -346,8 +377,11 @@ def build_replacements(data: dict) -> dict:
 
 
 def create_report(data: dict):
-    print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
-    _, res = dbx.files_download(TEMPLATE_PATH)
+    report_type_value = data.get(REPORT_TYPE_COLUMN_ID, "")
+    template_path = build_template_path(report_type_value)
+
+    print("DOWNLOADING TEMPLATE FROM:", template_path)
+    _, res = dbx.files_download(template_path)
     doc = Document(io.BytesIO(res.content))
 
     replacements = build_replacements(data)
@@ -391,7 +425,7 @@ def process_item(item_id: int):
     file_path = f"{findings_folder}/{file_name}"
 
     print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
-    print("TEMPLATE_PATH:", TEMPLATE_PATH)
+    print("TEMPLATE_DIR:", TEMPLATE_DIR)
     print("REPORT FOLDER:", report_folder)
     print("PHOTOS FOLDER:", photos_folder)
     print("FINDINGS FOLDER:", findings_folder)
