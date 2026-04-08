@@ -14,17 +14,38 @@ app = Flask(__name__)
 # ===== CONFIG =====
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
+
+# Dropbox OAuth refresh-token based auth
+DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY")
+DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET")
+DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
+
+# Optional fallback for short-lived token during migration/testing
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
+
+# monday Link column ID
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
-if not DROPBOX_TOKEN:
-    raise ValueError("Missing DROPBOX_TOKEN environment variable")
 
-dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+if DROPBOX_REFRESH_TOKEN:
+    if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
+        raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
+    dbx = dropbox.Dropbox(
+        oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+        app_key=DROPBOX_APP_KEY,
+        app_secret=DROPBOX_APP_SECRET,
+        timeout=120,
+    )
+    print("Dropbox client initialized with refresh token")
+elif DROPBOX_TOKEN:
+    dbx = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
+    print("Dropbox client initialized with access token")
+else:
+    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
 
 # ===== PATHS =====
 BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
@@ -34,7 +55,8 @@ TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
-FILES_COLUMN_ID = "FILES"   # Files column id in monday
+FILES_COLUMN_ID = "FILES"
+
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 # ===== PLACEHOLDER -> MONDAY COLUMN MAP =====
@@ -97,11 +119,6 @@ def get_item_data(item_id: int):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    """
-    Uploads the generated file to monday Files column.
-    If monday rejects the upload, caller may continue and still write Dropbox link.
-    Official endpoint: /v2/file. citeturn890302search0turn890302search10
-    """
     query = """
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
@@ -137,9 +154,6 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
 
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
-    """
-    Reliable update path for monday Link column using JSON payload.
-    """
     if not column_id:
         print("LINK COLUMN ID IS EMPTY - SKIPPING LINK UPDATE")
         return
@@ -346,7 +360,6 @@ def process_item(item_id: int):
 
     link = get_or_create_shared_link(file_path)
 
-    # Non-fatal upload to Files column so Dropbox link update still succeeds even if monday file endpoint fails
     try:
         upload_file_to_monday(
             item_id=item_id,
