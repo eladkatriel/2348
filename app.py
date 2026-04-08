@@ -24,15 +24,21 @@ DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
+# Shared-folder direct link supplied by the user
+DROPBOX_SHARED_LINK = os.environ.get(
+    "DROPBOX_SHARED_LINK",
+    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=jmwlckxp&dl=0",
+).strip()
+
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
 # ===== DROPBOX TARGETS =====
-TARGET_SHARED_FOLDER_NAME = "חרבות ברזל 2023"
-
-# The app will try these paths in order and use the first one that already exists.
+# Intended working root:
+# YOE/חרבות ברזל 2023/...
+# We keep candidates to support either mounted path or namespace-rooted path.
 BASE_PATH_CANDIDATES = [
     "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי",
     "/20260228 - שאגת הארי",
@@ -85,26 +91,53 @@ def init_dropbox():
     return dbx
 
 
-def maybe_attach_shared_namespace(dbx):
+def attach_shared_folder_from_link(dbx):
+    """
+    Try to anchor the client to the shared folder referred by the direct Dropbox link.
+    If we cannot derive a namespace, we still continue with the default root and
+    rely on the existing path candidates below.
+    """
+    if not DROPBOX_SHARED_LINK:
+        print("No shared link provided; using default Dropbox root")
+        return dbx
+
     try:
-        result = dbx.files_list_folder("")
-        for entry in result.entries:
-            entry_name = getattr(entry, "name", "")
-            entry_id = getattr(entry, "id", "")
-            print("ROOT ENTRY:", entry_name, entry_id)
-            if entry_name == TARGET_SHARED_FOLDER_NAME and entry_id.startswith("ns:"):
-                namespace_id = entry_id.replace("ns:", "")
+        meta = dbx.sharing_get_shared_link_metadata(DROPBOX_SHARED_LINK)
+        print("SHARED LINK METADATA TYPE:", type(meta).__name__)
+
+        # Try common namespace-like fields if exposed by SDK/runtime
+        for attr_name in ("namespace_id", "path_root"):
+            attr_val = getattr(meta, attr_name, None)
+            if attr_val:
+                namespace_id = str(attr_val).replace("ns:", "")
                 dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
-                print("Using auto-detected namespace:", namespace_id)
+                print("USING NAMESPACE FROM SHARED LINK:", namespace_id)
                 return dbx
+
+        # Fallback: look for a mounted root folder matching the expected name
+        try:
+            root_listing = dbx.files_list_folder("")
+            for entry in root_listing.entries:
+                entry_name = getattr(entry, "name", "")
+                entry_id = getattr(entry, "id", "")
+                print("ROOT ENTRY:", entry_name, entry_id)
+                if entry_name == "חרבות ברזל 2023" and entry_id.startswith("ns:"):
+                    namespace_id = entry_id.replace("ns:", "")
+                    dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
+                    print("USING DISCOVERED NAMESPACE:", namespace_id)
+                    return dbx
+        except Exception as e:
+            print("ROOT DISCOVERY FAILED:", str(e))
+
+        print("Shared link did not yield a namespace; using default root fallback")
+        return dbx
+
     except Exception as e:
-        print("Auto namespace detection failed; using default root:", str(e))
-
-    print("Shared namespace not auto-detected; using default root")
-    return dbx
+        print("FAILED TO ATTACH SHARED LINK:", str(e))
+        return dbx
 
 
-dbx = maybe_attach_shared_namespace(init_dropbox())
+dbx = attach_shared_folder_from_link(init_dropbox())
 
 
 def path_exists(path: str) -> bool:
@@ -289,13 +322,6 @@ def extract_first_date(value: str) -> str:
 
 
 def resolve_template_filename(report_type_value: str) -> str:
-    """
-    Mapping by monday column color_mm12nfzt text value:
-    קבלן => Contractor_template.docx
-    מהנדס => Engineer_template.docx
-    להריסה => Engineer_template.docx
-    נזק ישן, אין פינוי ואין פיצוי => Contractor_template.docx
-    """
     value = (report_type_value or "").strip()
 
     mapping = {
@@ -424,6 +450,7 @@ def process_item(item_id: int):
     )
     file_path = f"{findings_folder}/{file_name}"
 
+    print("DROPBOX_SHARED_LINK:", DROPBOX_SHARED_LINK)
     print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
     print("TEMPLATE_DIR:", TEMPLATE_DIR)
     print("REPORT FOLDER:", report_folder)
