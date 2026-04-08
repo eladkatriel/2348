@@ -15,16 +15,12 @@ app = Flask(__name__)
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
-
-# monday Link column ID
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
-
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
-
 if not DROPBOX_TOKEN:
     raise ValueError("Missing DROPBOX_TOKEN environment variable")
 
@@ -38,8 +34,7 @@ TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
-FILES_COLUMN_ID = "FILES"   # per your monday column id
-
+FILES_COLUMN_ID = "FILES"   # Files column id in monday
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 # ===== PLACEHOLDER -> MONDAY COLUMN MAP =====
@@ -102,6 +97,11 @@ def get_item_data(item_id: int):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
+    """
+    Uploads the generated file to monday Files column.
+    If monday rejects the upload, caller may continue and still write Dropbox link.
+    Official endpoint: /v2/file. citeturn890302search0turn890302search10
+    """
     query = """
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
@@ -138,8 +138,7 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
     """
-    Writes a monday Link column using change_multiple_column_values, which is
-    generally the most reliable method for JSON-formatted column values.
+    Reliable update path for monday Link column using JSON payload.
     """
     if not column_id:
         print("LINK COLUMN ID IS EMPTY - SKIPPING LINK UPDATE")
@@ -347,13 +346,17 @@ def process_item(item_id: int):
 
     link = get_or_create_shared_link(file_path)
 
-    upload_file_to_monday(
-        item_id=item_id,
-        column_id=FILES_COLUMN_ID,
-        file_name=file_name,
-        file_bytes=report_bytes,
-    )
-    print("FILE UPLOADED TO MONDAY FILES COLUMN")
+    # Non-fatal upload to Files column so Dropbox link update still succeeds even if monday file endpoint fails
+    try:
+        upload_file_to_monday(
+            item_id=item_id,
+            column_id=FILES_COLUMN_ID,
+            file_name=file_name,
+            file_bytes=report_bytes,
+        )
+        print("FILE UPLOADED TO MONDAY FILES COLUMN")
+    except Exception as e:
+        print("MONDAY FILE UPLOAD FAILED - CONTINUING:", str(e))
 
     update_link_column(
         item_id=item_id,
