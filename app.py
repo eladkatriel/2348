@@ -16,15 +16,11 @@ app = Flask(__name__)
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 
-# Dropbox OAuth refresh-token based auth
 DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET")
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
-
-# Optional fallback for short-lived token during migration/testing
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-# monday column ids
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
@@ -33,10 +29,19 @@ if not MONDAY_API_KEY:
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
-# ===== PATHS =====
+# ===== DROPBOX TARGETS =====
 TARGET_SHARED_FOLDER_NAME = "חרבות ברזל 2023"
-BASE_REPORTS_PATH = "/20260228 - שאגת הארי"
-TEMPLATE_PATH = "/Template/23-48/Contractor_template.docx"
+
+# The app will try these paths in order and use the first one that already exists.
+BASE_PATH_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי",
+    "/20260228 - שאגת הארי",
+]
+
+TEMPLATE_PATH_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/Template/23-48/Contractor_template.docx",
+    "/Template/23-48/Contractor_template.docx",
+]
 
 # ===== COLUMN IDS =====
 CITY_COLUMN_ID = "text_mm264acy"
@@ -45,7 +50,6 @@ ID_COLUMN_ID = "text_mm12vayb"
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-# ===== PLACEHOLDER -> MONDAY COLUMN MAP =====
 COLUMN_MAP = {
     "{{Engineer}}": "text_mm12tcvb",
     "{{Street}}": "text_mm12vcy9",
@@ -59,8 +63,7 @@ COLUMN_MAP = {
 }
 
 
-# ===== DROPBOX INIT WITH AUTO NAMESPACE =====
-def init_dropbox_with_auto_namespace():
+def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
             raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
@@ -78,45 +81,60 @@ def init_dropbox_with_auto_namespace():
         raise ValueError(
             "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
         )
+    return dbx
 
-    # auto-detect shared-folder namespace at root
+
+def maybe_attach_shared_namespace(dbx):
     try:
         result = dbx.files_list_folder("")
         for entry in result.entries:
-            if entry.name == TARGET_SHARED_FOLDER_NAME and getattr(entry, "id", "").startswith("id:") is False:
-                # shared folder entries at root are often namespace-backed and can expose ns: ids
-                entry_id = getattr(entry, "id", "")
-                print("ROOT ENTRY:", entry.name, entry_id)
-                if entry_id.startswith("ns:"):
-                    namespace_id = entry_id.replace("ns:", "")
-                    dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
-                    print("Using auto-detected namespace:", namespace_id)
-                    return dbx
-
-        # fallback: search mounted shared folders
-        try:
-            shared = dbx.sharing_list_folders()
-            for folder in shared.entries:
-                if folder.name == TARGET_SHARED_FOLDER_NAME:
-                    namespace_id = str(folder.shared_folder_id)
-                    print("Found shared folder by sharing_list_folders, shared_folder_id:", namespace_id)
-                    # keep default root if we couldn't get a namespace id
-                    break
-        except Exception as e:
-            print("sharing_list_folders lookup skipped/failed:", str(e))
-
-        print("Shared namespace not auto-detected; using default root")
-        return dbx
-
+            entry_name = getattr(entry, "name", "")
+            entry_id = getattr(entry, "id", "")
+            print("ROOT ENTRY:", entry_name, entry_id)
+            if entry_name == TARGET_SHARED_FOLDER_NAME and entry_id.startswith("ns:"):
+                namespace_id = entry_id.replace("ns:", "")
+                dbx = dbx.with_path_root(PathRoot.namespace_id(namespace_id))
+                print("Using auto-detected namespace:", namespace_id)
+                return dbx
     except Exception as e:
         print("Auto namespace detection failed; using default root:", str(e))
-        return dbx
+
+    print("Shared namespace not auto-detected; using default root")
+    return dbx
 
 
-dbx = init_dropbox_with_auto_namespace()
+dbx = maybe_attach_shared_namespace(init_dropbox())
 
 
-# ===== MONDAY API =====
+def path_exists(path: str) -> bool:
+    try:
+        dbx.files_get_metadata(path)
+        return True
+    except Exception as e:
+        print("PATH NOT FOUND:", path, str(e))
+        return False
+
+
+def resolve_existing_base_path() -> str:
+    for path in BASE_PATH_CANDIDATES:
+        if path_exists(path):
+            print("RESOLVED BASE REPORTS PATH:", path)
+            return path
+    raise Exception("Could not resolve reports base path. Checked: " + " | ".join(BASE_PATH_CANDIDATES))
+
+
+def resolve_existing_template_path() -> str:
+    for path in TEMPLATE_PATH_CANDIDATES:
+        if path_exists(path):
+            print("RESOLVED TEMPLATE PATH:", path)
+            return path
+    raise Exception("Could not resolve template path. Checked: " + " | ".join(TEMPLATE_PATH_CANDIDATES))
+
+
+BASE_REPORTS_PATH = resolve_existing_base_path()
+TEMPLATE_PATH = resolve_existing_template_path()
+
+
 def monday_query(query: str, variables: dict | None = None):
     response = requests.post(
         "https://api.monday.com/v2",
@@ -150,7 +168,6 @@ def get_item_data(item_id: int):
     """
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
-
     if not items:
         raise Exception(f"No item found for item_id={item_id}")
 
@@ -234,7 +251,6 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
     return result
 
 
-# ===== HELPERS =====
 def sanitize_filename(name: str) -> str:
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for ch in invalid_chars:
@@ -271,7 +287,6 @@ def extract_first_date(value: str) -> str:
     return match.group(0) if match else value.strip()
 
 
-# ===== WORD REPLACEMENT =====
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -282,7 +297,6 @@ def replace_in_paragraph(paragraph, replacements: dict):
 
     new_text = full_text
     changed = False
-
     for old, new in replacements.items():
         if old in new_text:
             new_text = new_text.replace(old, str(new))
@@ -316,10 +330,8 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
-# ===== DOCUMENT CREATION =====
 def build_replacements(data: dict) -> dict:
     replacements = {}
-
     for placeholder, col_id in COLUMN_MAP.items():
         replacements[placeholder] = data.get(col_id, "") or ""
 
@@ -333,7 +345,7 @@ def build_replacements(data: dict) -> dict:
     return replacements
 
 
-def create_report(data: dict) -> tuple[bytes, dict]:
+def create_report(data: dict):
     print("DOWNLOADING TEMPLATE FROM:", TEMPLATE_PATH)
     _, res = dbx.files_download(TEMPLATE_PATH)
     doc = Document(io.BytesIO(res.content))
@@ -351,16 +363,13 @@ def create_report(data: dict) -> tuple[bytes, dict]:
     return report_bytes, replacements
 
 
-# ===== MAIN PROCESS =====
 def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
-
     data = get_item_data(item_id)
     print("ITEM DATA:", data)
 
     project_name = (data.get("name", "") or "").strip() or f"project_{item_id}"
     city_name = (data.get(CITY_COLUMN_ID, "") or "").strip()
-
     if not city_name:
         raise Exception(f"City field is empty or missing (column id: {CITY_COLUMN_ID})")
 
@@ -381,6 +390,8 @@ def process_item(item_id: int):
     )
     file_path = f"{findings_folder}/{file_name}"
 
+    print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
+    print("TEMPLATE_PATH:", TEMPLATE_PATH)
     print("REPORT FOLDER:", report_folder)
     print("PHOTOS FOLDER:", photos_folder)
     print("FINDINGS FOLDER:", findings_folder)
@@ -429,7 +440,6 @@ def process_item(item_id: int):
     }
 
 
-# ===== ROUTES =====
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
