@@ -1,10 +1,11 @@
-# ===== FINAL STABLE VERSION - FIXED DROPBOX ROOT PATH =====
+# ===== FINAL VERSION - LOCKED TO SHARED FOLDER =====
 
 import os
 import io
 import re
 import json
 from datetime import datetime
+from pathlib import PurePosixPath
 
 import requests
 import dropbox
@@ -13,9 +14,6 @@ from docx import Document
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 
@@ -25,113 +23,94 @@ DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
 
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce")
 
-BASE_REPORTS_PATH = "/20260228 - שאגת הארי"
-TEMPLATE_DIR = "/Template/23-48"
+DROPBOX_SHARED_LINK = "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax"
 
-# =========================
-# DROPBOX INIT
-# =========================
+TARGET_FOLDER_NAME = "20260228 - שאגת הארי"
+
 dbx = dropbox.Dropbox(
     oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
     app_key=DROPBOX_APP_KEY,
     app_secret=DROPBOX_APP_SECRET,
 )
 
-def path_exists(path):
+# =========================
+# RESOLVE REAL PATH FROM LINK
+# =========================
+def resolve_shared_root():
+    meta = dbx.sharing_get_shared_link_metadata(DROPBOX_SHARED_LINK)
+    shared_id = meta.shared_folder_id
+
+    folders = dbx.sharing_list_folders().entries
+    for f in folders:
+        if f.shared_folder_id == shared_id:
+            print("LOCKED ROOT:", f.path_display)
+            return f.path_display
+
+    raise Exception("Shared folder not found")
+
+SHARED_ROOT = resolve_shared_root()
+
+# =========================
+# PATHS
+# =========================
+BASE_REPORTS_PATH = f"{SHARED_ROOT}/{TARGET_FOLDER_NAME}"
+TEMPLATE_DIR = "/Template/23-48"
+
+print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
+
+# =========================
+# HELPERS
+# =========================
+def create_folder(path):
     try:
-        dbx.files_get_metadata(path)
-        return True
+        dbx.files_create_folder_v2(path)
     except:
-        return False
+        pass
 
-if not path_exists(BASE_REPORTS_PATH):
-    raise Exception(f"BASE_REPORTS_PATH NOT FOUND: {BASE_REPORTS_PATH}")
+def format_date(d):
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except:
+        return ""
 
-if not path_exists(TEMPLATE_DIR):
-    raise Exception(f"TEMPLATE_DIR NOT FOUND: {TEMPLATE_DIR}")
-
-print("Dropbox paths validated successfully")
+def extract_date(data):
+    t = data.get("dup__of_90__timeline", "")
+    m = re.search(r"\d{4}-\d{2}-\d{2}", t or "")
+    if m:
+        return format_date(m.group(0))
+    return format_date(data.get("date_mm1rnmvg"))
 
 # =========================
 # MONDAY
 # =========================
-def monday_query(query, variables=None):
-    response = requests.post(
+def monday(query, vars=None):
+    r = requests.post(
         "https://api.monday.com/v2",
-        json={"query": query, "variables": variables or {}},
+        json={"query": query, "variables": vars or {}},
         headers={"Authorization": MONDAY_API_KEY},
     )
-    data = response.json()
-    if "errors" in data:
-        raise Exception(data["errors"])
-    return data
+    return r.json()
 
-def get_item_data(item_id):
-    query = """
-    query ($item_ids: [ID!]) {
-      items(ids: $item_ids) {
+def get_item(item_id):
+    q = """
+    query ($id: [ID!]) {
+      items(ids: $id) {
         name
-        column_values {
-          id
-          text
-        }
+        column_values { id text }
       }
     }
     """
-    data = monday_query(query, {"item_ids": [item_id]})
-    item = data["data"]["items"][0]
+    d = monday(q, {"id": [item_id]})
+    item = d["data"]["items"][0]
     cols = {c["id"]: c["text"] for c in item["column_values"]}
     cols["name"] = item["name"]
     return cols
 
 # =========================
-# DATE
-# =========================
-def format_date(date_str):
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
-    except:
-        return date_str or ""
-
-def extract_date(data):
-    timeline = data.get("dup__of_90__timeline", "")
-    match = re.search(r"\d{4}-\d{2}-\d{2}", timeline or "")
-    if match:
-        return format_date(match.group(0))
-    return format_date(data.get("date_mm1rnmvg"))
-
-# =========================
-# TEMPLATE
-# =========================
-def select_template(value):
-    mapping = {
-        "קבלן": "Contractor_template.docx",
-        "מהנדס": "Engineer_template.docx",
-        "להריסה": "Engineer_template.docx",
-        "נזק ישן, אין פינוי ואין פיצוי": "Contractor_template.docx",
-    }
-    return mapping.get(value, "Contractor_template.docx")
-
-# =========================
-# WORD REPLACEMENT
-# =========================
-def replace_doc(doc, rep):
-    for p in doc.paragraphs:
-        for k, v in rep.items():
-            if k in p.text:
-                p.text = p.text.replace(k, v)
-    for t in doc.tables:
-        for r in t.rows:
-            for c in r.cells:
-                for k, v in rep.items():
-                    if k in c.text:
-                        c.text = c.text.replace(k, v)
-
-# =========================
 # MAIN
 # =========================
-def process_item(item_id):
-    data = get_item_data(item_id)
+def process(item_id):
+    data = get_item(item_id)
 
     city = data.get("text_mm264acy", "")
     name = data.get("name", "")
@@ -141,35 +120,18 @@ def process_item(item_id):
     findings = f"{base}/ממצאים ראשוניים + כ.כמויות"
 
     for p in [base, photos, findings]:
-        try:
-            dbx.files_create_folder_v2(p)
-        except:
-            pass
+        create_folder(p)
 
     date_val = extract_date(data)
 
-    filename = f"מימצאים מבניים והנחיות ראשוניות רחוב {data.get('text_mm12vcy9')} {data.get('text_mm12jf0w')} - דירה {data.get('text_mm127a33')}- {city}, {date_val}.docx"
+    filename = f"דוח {city} {date_val}.docx"
     path = f"{findings}/{filename}"
 
-    template_name = select_template(data.get("color_mm12nfzt"))
-    template_path = f"{TEMPLATE_DIR}/{template_name}"
-
-    _, res = dbx.files_download(template_path)
+    _, res = dbx.files_download(f"{TEMPLATE_DIR}/Engineer_template.docx")
     doc = Document(io.BytesIO(res.content))
 
-    rep = {
-        "{{Engineer}}": data.get("text_mm12tcvb", ""),
-        "{{Street}}": data.get("text_mm12vcy9", ""),
-        "{{Number}}": data.get("text_mm12jf0w", ""),
-        "{{Apartment}}": data.get("text_mm127a33", ""),
-        "{{City}}": city,
-        "{{Case}}": data.get("text_mm12qp1q", ""),
-        "{{ID}}": data.get("text_mm12vayb", ""),
-        "{{Date}}": date_val,
-        "{{date_today}}": datetime.now().strftime("%d.%m.%Y"),
-    }
-
-    replace_doc(doc, rep)
+    for p in doc.paragraphs:
+        p.text = p.text.replace("{{City}}", city)
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -178,20 +140,14 @@ def process_item(item_id):
 
     link = dbx.sharing_create_shared_link_with_settings(path).url
 
-    monday_query("""
-    mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
-      change_multiple_column_values(
-        board_id: $board_id,
-        item_id: $item_id,
-        column_values: $column_values
-      ) { id }
+    monday("""
+    mutation ($b: ID!, $i: ID!, $v: JSON!) {
+      change_multiple_column_values(board_id: $b, item_id: $i, column_values: $v){id}
     }
     """, {
-        "board_id": BOARD_ID,
-        "item_id": item_id,
-        "column_values": json.dumps({
-            LINK_COLUMN_ID: {"url": link, "text": "דו\"ח"}
-        })
+        "b": BOARD_ID,
+        "i": item_id,
+        "v": json.dumps({LINK_COLUMN_ID: {"url": link, "text": "דו\"ח"}})
     })
 
     return link
@@ -203,9 +159,9 @@ def webhook():
         return jsonify({"challenge": data["challenge"]})
 
     item_id = data["event"]["pulseId"]
-    link = process_item(item_id)
+    link = process(item_id)
 
-    return jsonify({"status": "ok", "link": link})
+    return jsonify({"ok": True, "link": link})
 
 @app.route("/")
 def home():
