@@ -29,6 +29,7 @@ if not BOARD_ID:
 
 SHARED_ROOT_PATH = "/YOE/חרבות ברזל 2023"
 BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
+
 TEMPLATE_DIR_CANDIDATES = [
     "/YOE/חרבות ברזל 2023/Template/23-48",
     "/Template/23-48",
@@ -91,7 +92,7 @@ def path_exists(path: str) -> bool:
         return False
 
 
-def validate_required_report_paths():
+def validate_report_paths():
     required_paths = [SHARED_ROOT_PATH, BASE_REPORTS_PATH]
     missing = [p for p in required_paths if not path_exists(p)]
     if missing:
@@ -113,7 +114,7 @@ def resolve_template_dir():
     )
 
 
-validate_required_report_paths()
+validate_report_paths()
 TEMPLATE_DIR = resolve_template_dir()
 
 
@@ -260,11 +261,23 @@ def get_or_create_shared_link(file_path: str) -> str:
     return link
 
 
+def format_yyyy_mm_dd_to_dd_mm_yyyy(date_str: str) -> str:
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return date_str
+
+
 def extract_first_date(value: str) -> str:
     if not value:
         return ""
     match = re.search(r"\d{4}-\d{2}-\d{2}", value)
-    return match.group(0) if match else value.strip()
+    if not match:
+        return value.strip()
+
+    date_str = match.group(0)
+    return format_yyyy_mm_dd_to_dd_mm_yyyy(date_str)
 
 
 def resolve_template_filename(report_type_value: str) -> str:
@@ -342,10 +355,11 @@ def build_replacements(data: dict) -> dict:
 
     first_date = extract_first_date(
         (data.get("dup__of_90__timeline", "") or "").strip()
-    ) or (data.get("date_mm1rnmvg", "") or "").strip()
+    ) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
 
     replacements["{{Date}}"] = first_date
-    replacements["{{date_today}}"] = datetime.now().strftime("%d/%m/%Y")
+    replacements["{{Hit date}}"] = format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
+    replacements["{{date_today}}"] = datetime.now().strftime("%d.%m.%Y")
     replacements["{{ProjectName}}"] = data.get("name", "") or ""
     return replacements
 
@@ -390,7 +404,7 @@ def process_item(item_id: int):
     apartment = (data.get("text_mm127a33", "") or "").strip()
     report_date = extract_first_date(
         (data.get("dup__of_90__timeline", "") or "").strip()
-    ) or (data.get("date_mm1rnmvg", "") or "").strip()
+    ) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
 
     file_name = sanitize_filename(
         f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
