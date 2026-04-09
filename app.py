@@ -11,9 +11,6 @@ from docx import Document
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 
@@ -30,18 +27,13 @@ if not MONDAY_API_KEY:
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
-# =========================
-# EXACT DROPBOX PATHS
-# This version does NOT try alternative roots.
-# It will only work if these exact mounted/shared paths are visible.
-# =========================
 SHARED_ROOT_PATH = "/YOE/חרבות ברזל 2023"
 BASE_REPORTS_PATH = "/YOE/חרבות ברזל 2023/20260228 - שאגת הארי"
-TEMPLATE_DIR = "/YOE/חרבות ברזל 2023/Template/23-48"
+TEMPLATE_DIR_CANDIDATES = [
+    "/YOE/חרבות ברזל 2023/Template/23-48",
+    "/Template/23-48",
+]
 
-# =========================
-# COLUMN IDS
-# =========================
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
@@ -62,9 +54,6 @@ COLUMN_MAP = {
 }
 
 
-# =========================
-# DROPBOX
-# =========================
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
@@ -102,23 +91,32 @@ def path_exists(path: str) -> bool:
         return False
 
 
-def validate_required_paths():
-    required_paths = [SHARED_ROOT_PATH, BASE_REPORTS_PATH, TEMPLATE_DIR]
+def validate_required_report_paths():
+    required_paths = [SHARED_ROOT_PATH, BASE_REPORTS_PATH]
     missing = [p for p in required_paths if not path_exists(p)]
     if missing:
         raise Exception(
-            "Dropbox cannot see the required shared-folder paths. "
-            "This version is hard-locked and will not fall back. Missing: "
+            "Dropbox cannot see the required report paths. Missing: "
             + " | ".join(missing)
         )
-    print("Required Dropbox paths are visible and validated")
+    print("Required report paths are visible and validated")
 
 
-validate_required_paths()
+def resolve_template_dir():
+    for path in TEMPLATE_DIR_CANDIDATES:
+        if path_exists(path):
+            print("RESOLVED TEMPLATE DIR:", path)
+            return path
+    raise Exception(
+        "Dropbox cannot see any allowed template directory. Checked: "
+        + " | ".join(TEMPLATE_DIR_CANDIDATES)
+    )
 
-# =========================
-# MONDAY
-# =========================
+
+validate_required_report_paths()
+TEMPLATE_DIR = resolve_template_dir()
+
+
 def monday_query(query: str, variables=None):
     response = requests.post(
         "https://api.monday.com/v2",
@@ -138,7 +136,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -149,7 +147,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -163,13 +161,13 @@ def get_item_data(item_id: int):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
+    '''
     data = {
         "query": query,
         "variables": json.dumps({
@@ -209,7 +207,7 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         }
     })
 
-    query = """
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(
         board_id: $board_id,
@@ -219,7 +217,7 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         id
       }
     }
-    """
+    '''
 
     result = monday_query(
         query,
@@ -233,9 +231,6 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
     return result
 
 
-# =========================
-# HELPERS
-# =========================
 def sanitize_filename(name: str) -> str:
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for ch in invalid_chars:
@@ -295,9 +290,6 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
-# =========================
-# WORD
-# =========================
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -379,9 +371,6 @@ def create_report(data: dict):
     return report_bytes, replacements
 
 
-# =========================
-# MAIN
-# =========================
 def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
     data = get_item_data(item_id)
@@ -460,9 +449,6 @@ def process_item(item_id: int):
     }
 
 
-# =========================
-# ROUTES
-# =========================
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
