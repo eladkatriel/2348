@@ -23,7 +23,11 @@ DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
-DROPBOX_SHARED_LINK = "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=s94hoan7&dl=0"
+DROPBOX_SHARED_LINK = os.environ.get(
+    "DROPBOX_SHARED_LINK",
+    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=s94hoan7&dl=0",
+).strip()
+
 TARGET_REPORTS_FOLDER_NAME = "20260228 - שאגת הארי"
 TEMPLATE_RELATIVE_DIR = "Template/23-48"
 
@@ -64,10 +68,8 @@ def init_dropbox():
             app_secret=DROPBOX_APP_SECRET,
             timeout=120,
         )
-
     if DROPBOX_TOKEN:
         return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
-
     raise ValueError(
         "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
     )
@@ -87,6 +89,9 @@ def path_exists(path: str) -> bool:
 
 
 def resolve_shared_root_from_link(shared_link: str) -> str:
+    if not shared_link:
+        raise Exception("DROPBOX_SHARED_LINK is missing")
+
     meta = dbx.sharing_get_shared_link_metadata(shared_link)
     shared_folder_id = getattr(meta, "shared_folder_id", None)
     name = getattr(meta, "name", "")
@@ -116,13 +121,12 @@ def resolve_shared_root_from_link(shared_link: str) -> str:
     raise Exception("Could not resolve mounted Dropbox path from the shared link")
 
 
-def resolve_base_reports_and_template_dir(shared_root: str) -> tuple[str, str]:
+def resolve_base_reports_and_template_dir(shared_root: str):
     shared_root = shared_root.rstrip("/")
     base_name = PurePosixPath(shared_root).name
 
     child_reports = f"{shared_root}/{TARGET_REPORTS_FOLDER_NAME}"
     child_template_dir = f"{shared_root}/{TEMPLATE_RELATIVE_DIR}"
-
     direct_reports = shared_root
 
     template_candidates = [
@@ -136,8 +140,7 @@ def resolve_base_reports_and_template_dir(shared_root: str) -> tuple[str, str]:
         base_reports_path = child_reports
     else:
         raise Exception(
-            "Could not resolve the reports root from the shared link. "
-            f"Checked: {direct_reports} | {child_reports}"
+            f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}"
         )
 
     template_dir = None
@@ -149,7 +152,7 @@ def resolve_base_reports_and_template_dir(shared_root: str) -> tuple[str, str]:
     if not template_dir:
         raise Exception(
             "Could not resolve template directory from the shared link context. "
-            f"Checked: {' | '.join(template_candidates)}"
+            + "Checked: " + " | ".join(template_candidates)
         )
 
     print("FINAL BASE_REPORTS_PATH:", base_reports_path)
@@ -180,7 +183,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -191,11 +194,12 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
         raise Exception(f"No item found for item_id={item_id}")
+
     item = items[0]
     cols = {c["id"]: c.get("text", "") for c in item["column_values"]}
     cols["name"] = item["name"]
@@ -210,7 +214,8 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
             "text": text,
         }
     })
-    query = """
+
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(
         board_id: $board_id,
@@ -220,7 +225,8 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         id
       }
     }
-    """
+    '''
+
     result = monday_query(
         query,
         {
@@ -234,13 +240,13 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
+    '''
     data = {
         "query": query,
         "variables": json.dumps({
@@ -470,12 +476,20 @@ def home():
 def webhook():
     if request.method == "GET":
         return "Webhook endpoint is live", 200
+
     data = request.get_json(silent=True) or {}
     print("INCOMING DATA:", data)
+
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]}), 200
+
     try:
-        item_id = (data.get("event", {}).get("pulseId") or data.get("event", {}).get("itemId") or data.get("pulseId") or data.get("itemId"))
+        item_id = (
+            data.get("event", {}).get("pulseId")
+            or data.get("event", {}).get("itemId")
+            or data.get("pulseId")
+            or data.get("itemId")
+        )
         print("ITEM ID:", item_id)
         if not item_id:
             return jsonify({"error": "No item id found", "payload": data}), 400
@@ -488,8 +502,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-'''
-path = Path('/mnt/data/app_shared_link_resolved_v2.py')
-path.write_text(content, encoding='utf-8')
-print(path)
-quotelevanalysis to=python_user_visible.exec code stripped? tool only code; previous success.
