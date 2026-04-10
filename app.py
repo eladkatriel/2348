@@ -3,12 +3,19 @@ import io
 import re
 import json
 from datetime import datetime
-from pathlib import PurePosixPath
+from urllib.parse import quote_plus
 
 import requests
 import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
+from docx.shared import Inches
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+except Exception:
+    sync_playwright = None
+    PlaywrightTimeoutError = Exception
 
 app = Flask(__name__)
 
@@ -23,13 +30,12 @@ DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
-DROPBOX_SHARED_LINK = os.environ.get(
-    "DROPBOX_SHARED_LINK",
-    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=s94hoan7&dl=0",
-).strip()
+BASE_REPORTS_PATH = "/20260228 - שאגת הארי"
+TEMPLATE_DIR = "/Template/23-48"
 
-TARGET_REPORTS_FOLDER_NAME = "20260228 - שאגת הארי"
-TEMPLATE_RELATIVE_DIR = "Template/23-48"
+GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
+MAP_WIDTH_INCHES = 6.5
+MAP_HEIGHT_INCHES = 4.4
 
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
@@ -59,9 +65,7 @@ if not BOARD_ID:
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-            raise ValueError(
-                "Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET"
-            )
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
         return dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=DROPBOX_APP_KEY,
@@ -70,9 +74,7 @@ def init_dropbox():
         )
     if DROPBOX_TOKEN:
         return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
-    raise ValueError(
-        "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
-    )
+    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
 
 
 dbx = init_dropbox()
@@ -88,80 +90,15 @@ def path_exists(path: str) -> bool:
         return False
 
 
-def resolve_shared_root_from_link(shared_link: str) -> str:
-    if not shared_link:
-        raise Exception("DROPBOX_SHARED_LINK is missing")
-
-    meta = dbx.sharing_get_shared_link_metadata(shared_link)
-    shared_folder_id = getattr(meta, "shared_folder_id", None)
-    name = getattr(meta, "name", "")
-    print("SHARED LINK NAME:", name)
-    print("SHARED LINK SHARED_FOLDER_ID:", shared_folder_id)
-
-    if shared_folder_id:
-        listing = dbx.sharing_list_folders(limit=100)
-        while True:
-            for folder in listing.entries:
-                if str(getattr(folder, "shared_folder_id", "")) == str(shared_folder_id):
-                    mounted_path = getattr(folder, "path_display", None) or getattr(folder, "path_lower", None)
-                    if mounted_path:
-                        print("RESOLVED SHARED ROOT FROM LINK:", mounted_path)
-                        return mounted_path
-            if getattr(listing, "has_more", False):
-                listing = dbx.sharing_list_folders_continue(listing.cursor)
-            else:
-                break
-
-    for attr_name in ("path_display", "path_lower"):
-        value = getattr(meta, attr_name, None)
-        if value:
-            print("RESOLVED SHARED ROOT FROM LINK METADATA:", value)
-            return value
-
-    raise Exception("Could not resolve mounted Dropbox path from the shared link")
+def validate_required_paths():
+    required_paths = [BASE_REPORTS_PATH, TEMPLATE_DIR]
+    missing = [p for p in required_paths if not path_exists(p)]
+    if missing:
+        raise Exception("Dropbox cannot see the required paths. Missing: " + " | ".join(missing))
+    print("Required Dropbox paths are visible and validated")
 
 
-def resolve_base_reports_and_template_dir(shared_root: str):
-    shared_root = shared_root.rstrip("/")
-    base_name = PurePosixPath(shared_root).name
-
-    child_reports = f"{shared_root}/{TARGET_REPORTS_FOLDER_NAME}"
-    child_template_dir = f"{shared_root}/{TEMPLATE_RELATIVE_DIR}"
-    direct_reports = shared_root
-
-    template_candidates = [
-        child_template_dir,
-        "/Template/23-48",
-    ]
-
-    if base_name == TARGET_REPORTS_FOLDER_NAME and path_exists(direct_reports):
-        base_reports_path = direct_reports
-    elif path_exists(child_reports):
-        base_reports_path = child_reports
-    else:
-        raise Exception(
-            f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}"
-        )
-
-    template_dir = None
-    for candidate in template_candidates:
-        if path_exists(candidate):
-            template_dir = candidate
-            break
-
-    if not template_dir:
-        raise Exception(
-            "Could not resolve template directory from the shared link context. "
-            + "Checked: " + " | ".join(template_candidates)
-        )
-
-    print("FINAL BASE_REPORTS_PATH:", base_reports_path)
-    print("FINAL TEMPLATE_DIR:", template_dir)
-    return base_reports_path, template_dir
-
-
-SHARED_ROOT_PATH = resolve_shared_root_from_link(DROPBOX_SHARED_LINK)
-BASE_REPORTS_PATH, TEMPLATE_DIR = resolve_base_reports_and_template_dir(SHARED_ROOT_PATH)
+validate_required_paths()
 
 
 def monday_query(query: str, variables=None):
@@ -183,7 +120,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = '''
+    query = """
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -194,12 +131,11 @@ def get_item_data(item_id: int):
         }
       }
     }
-    '''
+    """
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
         raise Exception(f"No item found for item_id={item_id}")
-
     item = items[0]
     cols = {c["id"]: c.get("text", "") for c in item["column_values"]}
     cols["name"] = item["name"]
@@ -207,46 +143,14 @@ def get_item_data(item_id: int):
     return cols
 
 
-def update_link_column(item_id: int, column_id: str, url: str, text: str):
-    column_values = json.dumps({
-        column_id: {
-            "url": url,
-            "text": text,
-        }
-    })
-
-    query = '''
-    mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
-      change_multiple_column_values(
-        board_id: $board_id,
-        item_id: $item_id,
-        column_values: $column_values
-      ) {
-        id
-      }
-    }
-    '''
-
-    result = monday_query(
-        query,
-        {
-            "board_id": str(BOARD_ID),
-            "item_id": str(item_id),
-            "column_values": column_values,
-        },
-    )
-    print("LINK COLUMN UPDATE RESULT:", result)
-    return result
-
-
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = '''
+    query = """
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    '''
+    """
     data = {
         "query": query,
         "variables": json.dumps({
@@ -272,6 +176,29 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
     if "errors" in payload:
         raise Exception(f"monday file upload error: {payload['errors']}")
     return payload
+
+
+def update_link_column(item_id: int, column_id: str, url: str, text: str):
+    column_values = json.dumps({column_id: {"url": url, "text": text}})
+    query = """
+    mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
+      change_multiple_column_values(
+        board_id: $board_id,
+        item_id: $item_id,
+        column_values: $column_values
+      ) { id }
+    }
+    """
+    result = monday_query(
+        query,
+        {
+            "board_id": str(BOARD_ID),
+            "item_id": str(item_id),
+            "column_values": column_values,
+        },
+    )
+    print("LINK COLUMN UPDATE RESULT:", result)
+    return result
 
 
 def sanitize_filename(name: str) -> str:
@@ -342,6 +269,67 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
+def _dismiss_popups(page):
+    selectors = [
+        "button:has-text('אישור')",
+        "button:has-text('הבנתי')",
+        "button:has-text('סגור')",
+        "button:has-text('Close')",
+        "[aria-label='Close']",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.click(timeout=1000)
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+
+def create_govmap_image(address_text: str) -> bytes:
+    if sync_playwright is None:
+        raise Exception("Playwright is not installed. Add playwright to requirements and install chromium in Render build step.")
+
+    target_url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z=10"
+    print("GOVMAP ADDRESS:", address_text)
+    print("GOVMAP URL:", target_url)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1600, "height": 1000}, locale="he-IL")
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(5000)
+            _dismiss_popups(page)
+
+            try:
+                page.locator("text=שכבות").first.wait_for(timeout=10000)
+            except Exception:
+                pass
+
+            page.add_style_tag(content="""
+                header, nav, aside, footer { display:none !important; }
+            """)
+
+            page.wait_for_timeout(1000)
+
+            for selector in ["#map", "[id*='map']", "canvas", ".ol-viewport", ".esri-view-root"]:
+                try:
+                    loc = page.locator(selector).first
+                    if loc.count() > 0:
+                        box = loc.bounding_box()
+                        if box and box["width"] > 500 and box["height"] > 300:
+                            print("MAP SCREENSHOT SELECTOR:", selector)
+                            return loc.screenshot()
+                except Exception:
+                    continue
+
+            print("MAP SCREENSHOT FALLBACK: full page")
+            return page.screenshot(full_page=False)
+        finally:
+            browser.close()
+
+
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -381,6 +369,37 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
+def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}}"):
+    def try_insert(paragraph):
+        if placeholder in paragraph.text:
+            paragraph.text = paragraph.text.replace(placeholder, "")
+            img_stream = io.BytesIO(map_bytes)
+            run = paragraph.add_run()
+            run.add_picture(img_stream, width=Inches(MAP_WIDTH_INCHES), height=Inches(MAP_HEIGHT_INCHES))
+            return True
+        return False
+
+    for paragraph in doc.paragraphs:
+        if try_insert(paragraph):
+            return True
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if try_insert(paragraph):
+                        return True
+
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for paragraph in part.paragraphs:
+                if try_insert(paragraph):
+                    return True
+
+    print("MAP PLACEHOLDER NOT FOUND")
+    return False
+
+
 def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
@@ -403,6 +422,17 @@ def create_report(data: dict):
     replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
+
+    address_text = " ".join([
+        (data.get("text_mm12vcy9", "") or "").strip(),
+        (data.get("text_mm12jf0w", "") or "").strip(),
+        (data.get("text_mm264acy", "") or "").strip(),
+    ]).strip()
+
+    if address_text:
+        map_bytes = create_govmap_image(address_text)
+        replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
+
     buffer = io.BytesIO()
     doc.save(buffer)
     report_bytes = buffer.getvalue()
@@ -435,8 +465,6 @@ def process_item(item_id: int):
     )
     file_path = f"{findings_folder}/{file_name}"
 
-    print("DROPBOX_SHARED_LINK:", DROPBOX_SHARED_LINK)
-    print("SHARED_ROOT_PATH:", SHARED_ROOT_PATH)
     print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
     print("TEMPLATE_DIR:", TEMPLATE_DIR)
     print("REPORT FOLDER:", report_folder)
