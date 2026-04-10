@@ -3,3 +3,4 @@ python-docx
 flask
 requests
 gunicorn
+Pillow
