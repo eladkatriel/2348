@@ -3,3 +3,4 @@ requests
 dropbox
 python-docx
 gunicorn
+playwright
