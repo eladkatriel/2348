@@ -120,7 +120,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -131,7 +131,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -144,13 +144,13 @@ def get_item_data(item_id: int):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
+    '''
     data = {
         "query": query,
         "variables": json.dumps({
@@ -180,7 +180,7 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
     column_values = json.dumps({column_id: {"url": url, "text": text}})
-    query = """
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(
         board_id: $board_id,
@@ -188,7 +188,7 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         column_values: $column_values
       ) { id }
     }
-    """
+    '''
     result = monday_query(
         query,
         {
@@ -301,16 +301,7 @@ def create_govmap_image(address_text: str) -> bytes:
             page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
             page.wait_for_timeout(5000)
             _dismiss_popups(page)
-
-            try:
-                page.locator("text=שכבות").first.wait_for(timeout=10000)
-            except Exception:
-                pass
-
-            page.add_style_tag(content="""
-                header, nav, aside, footer { display:none !important; }
-            """)
-
+            page.add_style_tag(content="header, nav, aside, footer { display:none !important; }")
             page.wait_for_timeout(1000)
 
             for selector in ["#map", "[id*='map']", "canvas", ".ol-viewport", ".esri-view-root"]:
@@ -326,6 +317,8 @@ def create_govmap_image(address_text: str) -> bytes:
 
             print("MAP SCREENSHOT FALLBACK: full page")
             return page.screenshot(full_page=False)
+        except PlaywrightTimeoutError as e:
+            raise Exception(f"GovMap screenshot timeout: {str(e)}")
         finally:
             browser.close()
 
