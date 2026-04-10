@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import math
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -10,18 +11,10 @@ import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
 from docx.shared import Inches
-
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-except Exception:
-    sync_playwright = None
-    PlaywrightTimeoutError = Exception
+from PIL import Image, ImageDraw
 
 app = Flask(__name__)
 
-# =========================
-# ENV / CONFIG
-# =========================
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
 
@@ -33,13 +26,20 @@ DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
-# You can override these in Render environment variables if needed
 BASE_REPORTS_PATH = os.environ.get("DROPBOX_REPORTS_ROOT", "/20260228 - שאגת הארי").strip()
 TEMPLATE_DIR = os.environ.get("DROPBOX_TEMPLATE_DIR", "/Template/23-48").strip()
 
 GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+HTTP_USER_AGENT = os.environ.get("MAP_HTTP_USER_AGENT", "monday-dropbox-mvp1/1.0 (contact: admin)")
+
 MAP_WIDTH_INCHES = 6.5
 MAP_HEIGHT_INCHES = 4.4
+MAP_PIXEL_WIDTH = 1200
+MAP_PIXEL_HEIGHT = 812
+MAP_ZOOM = 17
+TILE_SIZE = 256
 
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
@@ -66,15 +66,10 @@ if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
 
-# =========================
-# DROPBOX
-# =========================
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-            raise ValueError(
-                "Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET"
-            )
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
         dbx = dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=DROPBOX_APP_KEY,
@@ -89,17 +84,12 @@ def init_dropbox():
         print("Dropbox initialized with access token")
         return dbx
 
-    raise ValueError(
-        "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
-    )
+    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
 
 
 dbx = init_dropbox()
 
 
-# =========================
-# MONDAY
-# =========================
 def monday_query(query: str, variables=None):
     response = requests.post(
         "https://api.monday.com/v2",
@@ -119,7 +109,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -130,7 +120,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -144,13 +134,13 @@ def get_item_data(item_id: int):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
+    '''
     data = {
         "query": query,
         "variables": json.dumps({
@@ -179,25 +169,16 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
 
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
-    column_values = json.dumps({
-        column_id: {
-            "url": url,
-            "text": text,
-        }
-    })
-
-    query = """
+    column_values = json.dumps({column_id: {"url": url, "text": text}})
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(
         board_id: $board_id,
         item_id: $item_id,
         column_values: $column_values
-      ) {
-        id
-      }
+      ) { id }
     }
-    """
-
+    '''
     result = monday_query(
         query,
         {
@@ -210,9 +191,6 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
     return result
 
 
-# =========================
-# HELPERS
-# =========================
 def sanitize_filename(name: str) -> str:
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for ch in invalid_chars:
@@ -280,78 +258,85 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
-# =========================
-# GOVMAP / PLAYWRIGHT
-# =========================
-def _dismiss_popups(page):
-    selectors = [
-        "button:has-text('אישור')",
-        "button:has-text('הבנתי')",
-        "button:has-text('סגור')",
-        "button:has-text('Close')",
-        "[aria-label='Close']",
-    ]
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.click(timeout=1000)
-            page.wait_for_timeout(400)
-        except Exception:
-            pass
-
-
-def create_govmap_image(address_text: str) -> bytes:
-    if sync_playwright is None:
-        raise Exception(
-            "Playwright is not installed. Add playwright to requirements and install chromium in Render build step."
-        )
-
-    target_url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z=10"
+def build_govmap_url(address_text: str) -> str:
+    url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z=10"
     print("GOVMAP ADDRESS:", address_text)
-    print("GOVMAP URL:", target_url)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        page = browser.new_page(viewport={"width": 1600, "height": 1000}, locale="he-IL")
-        try:
-            page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
-            page.wait_for_timeout(5000)
-            _dismiss_popups(page)
-
-            page.add_style_tag(content="header, nav, aside, footer { display:none !important; }")
-            page.wait_for_timeout(1000)
-
-            for selector in ["#map", "[id*='map']", "canvas", ".ol-viewport", ".esri-view-root"]:
-                try:
-                    loc = page.locator(selector).first
-                    if loc.count() > 0:
-                        box = loc.bounding_box()
-                        if box and box["width"] > 500 and box["height"] > 300:
-                            print("MAP SCREENSHOT SELECTOR:", selector)
-                            return loc.screenshot()
-                except Exception:
-                    continue
-
-            print("MAP SCREENSHOT FALLBACK: full page")
-            return page.screenshot(full_page=False)
-
-        except PlaywrightTimeoutError as e:
-            raise Exception(f"GovMap screenshot timeout: {str(e)}")
-        finally:
-            browser.close()
+    print("GOVMAP URL:", url)
+    return url
 
 
-# =========================
-# WORD
-# =========================
+def geocode_address(address_text: str):
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    params = {"q": address_text, "format": "jsonv2", "limit": 1, "addressdetails": 1}
+    response = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+    results = response.json()
+    if not results:
+        raise Exception(f"Address not found by geocoder: {address_text}")
+    lat = float(results[0]["lat"])
+    lon = float(results[0]["lon"])
+    print("GEOCODE RESULT:", lat, lon)
+    return lat, lon
+
+
+def latlon_to_world_pixels(lat: float, lon: float, zoom: int):
+    scale = (2 ** zoom) * TILE_SIZE
+    x = (lon + 180.0) / 360.0 * scale
+    lat_rad = math.radians(lat)
+    y = ((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0) * scale
+    return x, y
+
+
+def fetch_tile(z: int, x: int, y: int) -> Image.Image:
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    url = OSM_TILE_URL.format(z=z, x=x, y=y)
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+
+def create_static_map_image(address_text: str) -> bytes:
+    lat, lon = geocode_address(address_text)
+    world_x, world_y = latlon_to_world_pixels(lat, lon, MAP_ZOOM)
+    center_tile_x = int(world_x // TILE_SIZE)
+    center_tile_y = int(world_y // TILE_SIZE)
+
+    grid = 5
+    half = grid // 2
+    stitched = Image.new("RGB", (grid * TILE_SIZE, grid * TILE_SIZE), "white")
+
+    for gx in range(grid):
+        for gy in range(grid):
+            tile_x = center_tile_x + (gx - half)
+            tile_y = center_tile_y + (gy - half)
+            tile_img = fetch_tile(MAP_ZOOM, tile_x, tile_y)
+            stitched.paste(tile_img, (gx * TILE_SIZE, gy * TILE_SIZE))
+
+    top_left_world_x = (center_tile_x - half) * TILE_SIZE
+    top_left_world_y = (center_tile_y - half) * TILE_SIZE
+    point_x = world_x - top_left_world_x
+    point_y = world_y - top_left_world_y
+
+    left = int(round(point_x - MAP_PIXEL_WIDTH / 2))
+    top = int(round(point_y - MAP_PIXEL_HEIGHT / 2))
+    left = max(0, min(left, stitched.width - MAP_PIXEL_WIDTH))
+    top = max(0, min(top, stitched.height - MAP_PIXEL_HEIGHT))
+
+    cropped = stitched.crop((left, top, left + MAP_PIXEL_WIDTH, top + MAP_PIXEL_HEIGHT))
+
+    marker_x = int(round(point_x - left))
+    marker_y = int(round(point_y - top))
+    draw = ImageDraw.Draw(cropped)
+    r = 16
+    draw.ellipse((marker_x - r, marker_y - r, marker_x + r, marker_y + r), fill=(220, 0, 0), outline=(255, 255, 255), width=3)
+    draw.line((marker_x, marker_y + r, marker_x, marker_y + r + 22), fill=(220, 0, 0), width=6)
+
+    out = io.BytesIO()
+    cropped.save(out, format="PNG")
+    print("STATIC MAP IMAGE CREATED")
+    return out.getvalue()
+
+
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -394,38 +379,50 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
-def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}}"):
-    def try_insert(paragraph):
-        if placeholder in paragraph.text:
-            paragraph.text = paragraph.text.replace(placeholder, "")
-            img_stream = io.BytesIO(map_bytes)
+def replace_map_placeholder_with_image_or_text(doc: Document, address_text: str, govmap_url: str, placeholder="{{Map}}"):
+    map_text = f"מיקום הנכס: {address_text}\nקישור למפה (GovMap): {govmap_url}"
+    map_bytes = None
+
+    try:
+        map_bytes = create_static_map_image(address_text)
+    except Exception as e:
+        print("STATIC MAP GENERATION FAILED:", str(e))
+
+    def try_replace(paragraph):
+        if placeholder not in paragraph.text:
+            return False
+
+        paragraph.text = paragraph.text.replace(placeholder, "")
+        if map_bytes:
             run = paragraph.add_run()
-            run.add_picture(
-                img_stream,
-                width=Inches(MAP_WIDTH_INCHES),
-                height=Inches(MAP_HEIGHT_INCHES),
-            )
-            return True
-        return False
+            run.add_picture(io.BytesIO(map_bytes), width=Inches(MAP_WIDTH_INCHES), height=Inches(MAP_HEIGHT_INCHES))
+        else:
+            if paragraph.runs:
+                paragraph.runs[0].text = map_text
+                for run in paragraph.runs[1:]:
+                    run.text = ""
+            else:
+                paragraph.text = map_text
+        return True
 
     for paragraph in doc.paragraphs:
-        if try_insert(paragraph):
-            print("MAP INSERTED IN BODY")
+        if try_replace(paragraph):
+            print("MAP PLACEHOLDER REPLACED IN BODY")
             return True
 
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
-                    if try_insert(paragraph):
-                        print("MAP INSERTED IN TABLE")
+                    if try_replace(paragraph):
+                        print("MAP PLACEHOLDER REPLACED IN TABLE")
                         return True
 
     for section in doc.sections:
         for part in (section.header, section.footer):
             for paragraph in part.paragraphs:
-                if try_insert(paragraph):
-                    print("MAP INSERTED IN HEADER/FOOTER")
+                if try_replace(paragraph):
+                    print("MAP PLACEHOLDER REPLACED IN HEADER/FOOTER")
                     return True
 
     print("MAP PLACEHOLDER NOT FOUND")
@@ -463,8 +460,8 @@ def create_report(data: dict):
     ]).strip()
 
     if address_text:
-        map_bytes = create_govmap_image(address_text)
-        replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
+        govmap_url = build_govmap_url(address_text)
+        replace_map_placeholder_with_image_or_text(doc, address_text, govmap_url, placeholder="{{Map}}")
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -473,9 +470,6 @@ def create_report(data: dict):
     return report_bytes, replacements
 
 
-# =========================
-# MAIN
-# =========================
 def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
     data = get_item_data(item_id)
@@ -531,9 +525,6 @@ def process_item(item_id: int):
     return {"link": link, "file_name": file_name, "replacements": replacements}
 
 
-# =========================
-# ROUTES
-# =========================
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
