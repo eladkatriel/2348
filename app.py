@@ -97,15 +97,6 @@ def init_dropbox():
 dbx = init_dropbox()
 
 
-def path_exists(path: str) -> bool:
-    try:
-        dbx.files_get_metadata(path)
-        return True
-    except Exception as e:
-        print("PATH NOT FOUND:", path, str(e))
-        return False
-
-
 # =========================
 # MONDAY
 # =========================
@@ -320,7 +311,15 @@ def create_govmap_image(address_text: str) -> bytes:
     print("GOVMAP URL:", target_url)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         page = browser.new_page(viewport={"width": 1600, "height": 1000}, locale="he-IL")
         try:
             page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
