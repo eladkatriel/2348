@@ -12,7 +12,12 @@ import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
 from docx.shared import Inches
-from PIL import Image, ImageDraw
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+except Exception:
+    sync_playwright = None
+    PlaywrightTimeoutError = Exception
 
 app = Flask(__name__)
 
@@ -29,7 +34,7 @@ FILES_COLUMN_ID = "FILES"
 
 DROPBOX_SHARED_LINK = os.environ.get(
     "DROPBOX_SHARED_LINK",
-    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=s94hoan7&dl=0",
+    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=o32icz46&dl=0",
 ).strip()
 
 TARGET_REPORTS_FOLDER_NAME = "20260228 - שאגת הארי"
@@ -42,22 +47,6 @@ REPORT_TYPE_COLUMN_ID = "color_mm12nfzt"
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-# GovMap image settings
-GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
-GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
-HTTP_USER_AGENT = os.environ.get("MAP_HTTP_USER_AGENT", "monday-dropbox-mvp1/1.0 (contact: admin)")
-MAP_WIDTH_INCHES = 6.5
-MAP_HEIGHT_INCHES = 4.4
-MAP_PIXEL_WIDTH = 1200
-MAP_PIXEL_HEIGHT = 812
-TARGET_HORIZONTAL_METERS = 50.0
-TOLERANCE_METERS = 5.0
-TILE_SIZE = 256
-SATELLITE_TILE_URL = (
-    "https://services.arcgisonline.com/ArcGIS/rest/services/"
-    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-)
-
 COLUMN_MAP = {
     "{{Engineer}}": "text_mm12tcvb",
     "{{Street}}": "text_mm12vcy9",
@@ -69,6 +58,17 @@ COLUMN_MAP = {
     "{{Case}}": CASE_COLUMN_ID,
     "{{ID}}": ID_COLUMN_ID,
 }
+
+# GovMap screenshot settings
+GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
+GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
+HTTP_USER_AGENT = os.environ.get("MAP_HTTP_USER_AGENT", "monday-dropbox-mvp1/1.0 (contact: admin)")
+MAP_WIDTH_INCHES = 6.5
+MAP_HEIGHT_INCHES = 4.4
+MAP_PIXEL_WIDTH = 1200
+MAP_PIXEL_HEIGHT = 812
+TARGET_HORIZONTAL_METERS = 50.0
+TOLERANCE_METERS = 5.0
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
@@ -228,12 +228,7 @@ def get_item_data(item_id: int):
 
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
-    column_values = json.dumps({
-        column_id: {
-            "url": url,
-            "text": text,
-        }
-    })
+    column_values = json.dumps({column_id: {"url": url, "text": text}})
 
     query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
@@ -362,6 +357,132 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
+def geocode_address(address_text: str):
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    params = {
+        "q": address_text,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    response = requests.get(GEOCODER_URL, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+    results = response.json()
+    if not results:
+        raise Exception(f"Address not found by geocoder: {address_text}")
+    lat = float(results[0]["lat"])
+    lon = float(results[0]["lon"])
+    print("GEOCODE RESULT:", lat, lon)
+    return lat, lon
+
+
+def calc_zoom_from_target_width(lat: float, target_horizontal_meters: float, map_width_px: int) -> int:
+    meters_per_pixel = target_horizontal_meters / map_width_px
+    zoom = math.log2((156543.03392 * math.cos(math.radians(lat))) / meters_per_pixel)
+    zoom_int = max(1, min(22, int(round(zoom))))
+    print("TARGET WIDTH METERS:", target_horizontal_meters)
+    print("TOLERANCE METERS:", TOLERANCE_METERS)
+    print("CALCULATED GOVMAP ZOOM:", zoom_int)
+    return zoom_int
+
+
+def build_govmap_map_url(address_text: str, zoom: int) -> str:
+    url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z={zoom}"
+    print("GOVMAP ADDRESS:", address_text)
+    print("GOVMAP URL:", url)
+    return url
+
+
+def _dismiss_popups(page):
+    selectors = [
+        "button:has-text('אישור')",
+        "button:has-text('הבנתי')",
+        "button:has-text('סגור')",
+        "button:has-text('Close')",
+        "[aria-label='Close']",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.click(timeout=1000)
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+
+def create_govmap_satellite_image(address_text: str) -> bytes:
+    if sync_playwright is None:
+        raise Exception(
+            "Playwright is not installed. Add playwright to requirements and install chromium in the build step."
+        )
+
+    lat, lon = geocode_address(address_text)
+    zoom = calc_zoom_from_target_width(lat, TARGET_HORIZONTAL_METERS, MAP_PIXEL_WIDTH)
+    target_url = build_govmap_map_url(address_text, zoom)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        page = browser.new_page(
+            viewport={"width": 1600, "height": 1000},
+            locale="he-IL",
+            device_scale_factor=1,
+        )
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(7000)
+            _dismiss_popups(page)
+
+            page.add_style_tag(content="""
+                header, nav, aside, footer,
+                [class*='header'], [class*='toolbar'], [class*='search'],
+                [class*='panel'], [class*='legend'], [class*='basemap'],
+                [class*='controls'], [class*='button'] {
+                    visibility: hidden !important;
+                }
+            """)
+            page.wait_for_timeout(1500)
+
+            map_candidates = [
+                "#map",
+                "[id*='map']",
+                "canvas",
+                ".ol-viewport",
+                ".esri-view-root",
+            ]
+
+            screenshot_bytes = None
+            for selector in map_candidates:
+                try:
+                    locator = page.locator(selector).first
+                    if locator.count() > 0:
+                        box = locator.bounding_box()
+                        if box and box["width"] > 500 and box["height"] > 300:
+                            screenshot_bytes = locator.screenshot()
+                            print("MAP SCREENSHOT SELECTOR:", selector)
+                            break
+                except Exception:
+                    continue
+
+            if screenshot_bytes is None:
+                screenshot_bytes = page.screenshot(full_page=False)
+                print("MAP SCREENSHOT FALLBACK: page.screenshot()")
+
+            return screenshot_bytes
+
+        except PlaywrightTimeoutError as e:
+            raise Exception(f"GovMap screenshot timeout: {str(e)}")
+        finally:
+            browser.close()
+
+
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
@@ -401,96 +522,6 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
-
-def geocode_address(address_text: str):
-    headers = {"User-Agent": HTTP_USER_AGENT}
-    params = {
-        "q": address_text,
-        "format": "jsonv2",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    response = requests.get(GEOCODER_URL, params=params, headers=headers, timeout=30)
-    response.raise_for_status()
-    results = response.json()
-    if not results:
-        raise Exception(f"Address not found by geocoder: {address_text}")
-    lat = float(results[0]["lat"])
-    lon = float(results[0]["lon"])
-    print("GEOCODE RESULT:", lat, lon)
-    return lat, lon
-
-
-def calc_zoom_for_horizontal_meters(lat: float, target_horizontal_meters: float, image_width_px: int) -> int:
-    meters_per_pixel = target_horizontal_meters / image_width_px
-    zoom = math.log2((156543.03392 * math.cos(math.radians(lat))) / meters_per_pixel)
-    zoom_int = max(1, min(22, int(round(zoom))))
-    print("TARGET WIDTH METERS:", target_horizontal_meters)
-    print("TOLERANCE METERS:", TOLERANCE_METERS)
-    print("CALCULATED ZOOM:", zoom_int)
-    return zoom_int
-
-
-def latlon_to_world_pixels(lat: float, lon: float, zoom: int):
-    scale = (2 ** zoom) * TILE_SIZE
-    x = (lon + 180.0) / 360.0 * scale
-    lat_rad = math.radians(lat)
-    y = ((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0) * scale
-    return x, y
-
-
-def fetch_tile(z: int, x: int, y: int) -> Image.Image:
-    url = SATELLITE_TILE_URL.format(z=z, y=y, x=x)
-    headers = {"User-Agent": HTTP_USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
-    return Image.open(io.BytesIO(response.content)).convert("RGB")
-
-
-def build_satellite_map_image(address_text: str) -> bytes:
-    lat, lon = geocode_address(address_text)
-    zoom = calc_zoom_for_horizontal_meters(lat, TARGET_HORIZONTAL_METERS, MAP_PIXEL_WIDTH)
-
-    world_x, world_y = latlon_to_world_pixels(lat, lon, zoom)
-    center_tile_x = int(world_x // TILE_SIZE)
-    center_tile_y = int(world_y // TILE_SIZE)
-
-    grid = 5
-    half = grid // 2
-    stitched = Image.new("RGB", (grid * TILE_SIZE, grid * TILE_SIZE), "white")
-
-    for gx in range(grid):
-        for gy in range(grid):
-            tile_x = center_tile_x + (gx - half)
-            tile_y = center_tile_y + (gy - half)
-            tile_img = fetch_tile(zoom, tile_x, tile_y)
-            stitched.paste(tile_img, (gx * TILE_SIZE, gy * TILE_SIZE))
-
-    top_left_world_x = (center_tile_x - half) * TILE_SIZE
-    top_left_world_y = (center_tile_y - half) * TILE_SIZE
-    point_x = world_x - top_left_world_x
-    point_y = world_y - top_left_world_y
-
-    left = int(round(point_x - MAP_PIXEL_WIDTH / 2))
-    top = int(round(point_y - MAP_PIXEL_HEIGHT / 2))
-    left = max(0, min(left, stitched.width - MAP_PIXEL_WIDTH))
-    top = max(0, min(top, stitched.height - MAP_PIXEL_HEIGHT))
-
-    cropped = stitched.crop((left, top, left + MAP_PIXEL_WIDTH, top + MAP_PIXEL_HEIGHT))
-
-    marker_x = int(round(point_x - left))
-    marker_y = int(round(point_y - top))
-    draw = ImageDraw.Draw(cropped)
-    r = 16
-    draw.ellipse((marker_x - r, marker_y - r, marker_x + r, marker_y + r), fill=(220, 0, 0), outline=(255, 255, 255), width=3)
-    draw.line((marker_x, marker_y + r, marker_x, marker_y + r + 22), fill=(220, 0, 0), width=6)
-
-    out = io.BytesIO()
-    cropped.save(out, format="PNG")
-    print("SATELLITE MAP IMAGE CREATED")
-    return out.getvalue()
-
-
 def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}}"):
     def try_insert(paragraph):
         if placeholder in paragraph.text:
@@ -523,6 +554,7 @@ def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}
     print("MAP PLACEHOLDER NOT FOUND")
     return False
 
+
 def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
@@ -534,7 +566,6 @@ def build_replacements(data: dict) -> dict:
     replacements["{{date_today}}"] = datetime.now().strftime("%d.%m.%Y")
     replacements["{{ProjectName}}"] = data.get("name", "") or ""
     return replacements
-
 
 
 def create_report(data: dict):
@@ -554,7 +585,7 @@ def create_report(data: dict):
     ]).strip()
 
     if address_text:
-        map_bytes = build_satellite_map_image(address_text)
+        map_bytes = create_govmap_satellite_image(address_text)
         replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
 
     buffer = io.BytesIO()
