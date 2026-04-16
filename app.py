@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import math
 from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import quote_plus
@@ -23,30 +22,23 @@ app = Flask(__name__)
 
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
-
 DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET")
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
-
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
-
 DROPBOX_SHARED_LINK = os.environ.get(
     "DROPBOX_SHARED_LINK",
     "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=o32icz46&dl=0",
 ).strip()
-
 TARGET_REPORTS_FOLDER_NAME = "20260228 - שאגת הארי"
 TEMPLATE_RELATIVE_DIR = "Template/23-48"
-
 CITY_COLUMN_ID = "text_mm264acy"
 CASE_COLUMN_ID = "text_mm12qp1q"
 ID_COLUMN_ID = "text_mm12vayb"
 REPORT_TYPE_COLUMN_ID = "color_mm12nfzt"
-
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-
 COLUMN_MAP = {
     "{{Engineer}}": "text_mm12tcvb",
     "{{Street}}": "text_mm12vcy9",
@@ -58,17 +50,11 @@ COLUMN_MAP = {
     "{{Case}}": CASE_COLUMN_ID,
     "{{ID}}": ID_COLUMN_ID,
 }
-
-# GovMap screenshot settings
 GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
-GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
-HTTP_USER_AGENT = os.environ.get("MAP_HTTP_USER_AGENT", "monday-dropbox-mvp1/1.0 (contact: admin)")
 MAP_WIDTH_INCHES = 6.5
 MAP_HEIGHT_INCHES = 4.4
-MAP_PIXEL_WIDTH = 1200
-MAP_PIXEL_HEIGHT = 812
-TARGET_HORIZONTAL_METERS = 50.0
-TOLERANCE_METERS = 5.0
+GOVMAP_FIXED_ZOOM = 19
+MAP_CACHE = {}
 
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
@@ -79,9 +65,7 @@ if not BOARD_ID:
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-            raise ValueError(
-                "Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET"
-            )
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
         return dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=DROPBOX_APP_KEY,
@@ -90,9 +74,7 @@ def init_dropbox():
         )
     if DROPBOX_TOKEN:
         return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
-    raise ValueError(
-        "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
-    )
+    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
 
 
 dbx = init_dropbox()
@@ -111,13 +93,11 @@ def path_exists(path: str) -> bool:
 def resolve_shared_root_from_link(shared_link: str) -> str:
     if not shared_link:
         raise Exception("DROPBOX_SHARED_LINK is missing")
-
     meta = dbx.sharing_get_shared_link_metadata(shared_link)
     shared_folder_id = getattr(meta, "shared_folder_id", None)
     name = getattr(meta, "name", "")
     print("SHARED LINK NAME:", name)
     print("SHARED LINK SHARED_FOLDER_ID:", shared_folder_id)
-
     if shared_folder_id:
         listing = dbx.sharing_list_folders(limit=100)
         while True:
@@ -131,50 +111,34 @@ def resolve_shared_root_from_link(shared_link: str) -> str:
                 listing = dbx.sharing_list_folders_continue(listing.cursor)
             else:
                 break
-
     for attr_name in ("path_display", "path_lower"):
         value = getattr(meta, attr_name, None)
         if value:
             print("RESOLVED SHARED ROOT FROM LINK METADATA:", value)
             return value
-
     raise Exception("Could not resolve mounted Dropbox path from the shared link")
 
 
 def resolve_base_reports_and_template_dir(shared_root: str):
     shared_root = shared_root.rstrip("/")
     base_name = PurePosixPath(shared_root).name
-
     child_reports = f"{shared_root}/{TARGET_REPORTS_FOLDER_NAME}"
     child_template_dir = f"{shared_root}/{TEMPLATE_RELATIVE_DIR}"
     direct_reports = shared_root
-
-    template_candidates = [
-        child_template_dir,
-        "/Template/23-48",
-    ]
-
+    template_candidates = [child_template_dir, "/Template/23-48"]
     if base_name == TARGET_REPORTS_FOLDER_NAME and path_exists(direct_reports):
         base_reports_path = direct_reports
     elif path_exists(child_reports):
         base_reports_path = child_reports
     else:
-        raise Exception(
-            f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}"
-        )
-
+        raise Exception(f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}")
     template_dir = None
     for candidate in template_candidates:
         if path_exists(candidate):
             template_dir = candidate
             break
-
     if not template_dir:
-        raise Exception(
-            "Could not resolve template directory from the shared link context. "
-            + "Checked: " + " | ".join(template_candidates)
-        )
-
+        raise Exception("Could not resolve template directory from the shared link context. Checked: " + " | ".join(template_candidates))
     print("FINAL BASE_REPORTS_PATH:", base_reports_path)
     print("FINAL TEMPLATE_DIR:", template_dir)
     return base_reports_path, template_dir
@@ -188,11 +152,7 @@ def monday_query(query: str, variables=None):
     response = requests.post(
         "https://api.monday.com/v2",
         json={"query": query, "variables": variables or {}},
-        headers={
-            "Authorization": MONDAY_API_KEY,
-            "Content-Type": "application/json",
-            "API-Version": "2026-04",
-        },
+        headers={"Authorization": MONDAY_API_KEY, "Content-Type": "application/json", "API-Version": "2026-04"},
         timeout=60,
     )
     response.raise_for_status()
@@ -203,7 +163,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = '''
+    query = """
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -214,12 +174,11 @@ def get_item_data(item_id: int):
         }
       }
     }
-    '''
+    """
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
         raise Exception(f"No item found for item_id={item_id}")
-
     item = items[0]
     cols = {c["id"]: c.get("text", "") for c in item["column_values"]}
     cols["name"] = item["name"]
@@ -229,59 +188,29 @@ def get_item_data(item_id: int):
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
     column_values = json.dumps({column_id: {"url": url, "text": text}})
-
-    query = '''
+    query = """
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
-      change_multiple_column_values(
-        board_id: $board_id,
-        item_id: $item_id,
-        column_values: $column_values
-      ) {
+      change_multiple_column_values(board_id: $board_id, item_id: $item_id, column_values: $column_values) {
         id
       }
     }
-    '''
-
-    result = monday_query(
-        query,
-        {
-            "board_id": str(BOARD_ID),
-            "item_id": str(item_id),
-            "column_values": column_values,
-        },
-    )
+    """
+    result = monday_query(query, {"board_id": str(BOARD_ID), "item_id": str(item_id), "column_values": column_values})
     print("LINK COLUMN UPDATE RESULT:", result)
     return result
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = '''
+    query = """
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    '''
-    data = {
-        "query": query,
-        "variables": json.dumps({
-            "item_id": str(item_id),
-            "column_id": column_id,
-        }),
-    }
-    files = {
-        "variables[file]": (file_name, file_bytes, DOCX_MIME),
-    }
-    response = requests.post(
-        "https://api.monday.com/v2/file",
-        headers={
-            "Authorization": MONDAY_API_KEY,
-            "API-Version": "2026-04",
-        },
-        data=data,
-        files=files,
-        timeout=120,
-    )
+    """
+    data = {"query": query, "variables": json.dumps({"item_id": str(item_id), "column_id": column_id})}
+    files = {"variables[file]": (file_name, file_bytes, DOCX_MIME)}
+    response = requests.post("https://api.monday.com/v2/file", headers={"Authorization": MONDAY_API_KEY, "API-Version": "2026-04"}, data=data, files=files, timeout=120)
     response.raise_for_status()
     payload = response.json()
     if "errors" in payload:
@@ -336,12 +265,7 @@ def extract_first_date(value: str) -> str:
 
 def resolve_template_filename(report_type_value: str) -> str:
     value = (report_type_value or "").strip()
-    mapping = {
-        "קבלן": "Contractor_template.docx",
-        "מהנדס": "Engineer_template.docx",
-        "להריסה": "Engineer_template.docx",
-        "נזק ישן, אין פינוי ואין פיצוי": "Contractor_template.docx",
-    }
+    mapping = {"קבלן": "Contractor_template.docx", "מהנדס": "Engineer_template.docx", "להריסה": "Engineer_template.docx", "נזק ישן, אין פינוי ואין פיצוי": "Contractor_template.docx"}
     selected = mapping.get(value, "Contractor_template.docx")
     print("REPORT TYPE VALUE:", value)
     print("SELECTED TEMPLATE FILE:", selected)
@@ -357,50 +281,16 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
-def geocode_address(address_text: str):
-    headers = {"User-Agent": HTTP_USER_AGENT}
-    params = {
-        "q": address_text,
-        "format": "jsonv2",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    response = requests.get(GEOCODER_URL, params=params, headers=headers, timeout=30)
-    response.raise_for_status()
-    results = response.json()
-    if not results:
-        raise Exception(f"Address not found by geocoder: {address_text}")
-    lat = float(results[0]["lat"])
-    lon = float(results[0]["lon"])
-    print("GEOCODE RESULT:", lat, lon)
-    return lat, lon
-
-
-def calc_zoom_from_target_width(lat: float, target_horizontal_meters: float, map_width_px: int) -> int:
-    meters_per_pixel = target_horizontal_meters / map_width_px
-    zoom = math.log2((156543.03392 * math.cos(math.radians(lat))) / meters_per_pixel)
-    zoom_int = max(1, min(22, int(round(zoom))))
-    print("TARGET WIDTH METERS:", target_horizontal_meters)
-    print("TOLERANCE METERS:", TOLERANCE_METERS)
-    print("CALCULATED GOVMAP ZOOM:", zoom_int)
-    return zoom_int
-
-
-def build_govmap_map_url(address_text: str, zoom: int) -> str:
-    url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z={zoom}"
+def build_govmap_map_url(address_text: str) -> str:
+    url = f"{GOVMAP_BASE_URL}?b=2&q={quote_plus(address_text)}&z={GOVMAP_FIXED_ZOOM}"
     print("GOVMAP ADDRESS:", address_text)
     print("GOVMAP URL:", url)
+    print("FIXED GOVMAP ZOOM:", GOVMAP_FIXED_ZOOM)
     return url
 
 
 def _dismiss_popups(page):
-    selectors = [
-        "button:has-text('אישור')",
-        "button:has-text('הבנתי')",
-        "button:has-text('סגור')",
-        "button:has-text('Close')",
-        "[aria-label='Close']",
-    ]
+    selectors = ["button:has-text('אישור')", "button:has-text('הבנתי')", "button:has-text('סגור')", "button:has-text('Close')", "[aria-label='Close']"]
     for selector in selectors:
         try:
             locator = page.locator(selector).first
@@ -411,55 +301,22 @@ def _dismiss_popups(page):
 
 
 def create_govmap_satellite_image(address_text: str) -> bytes:
+    if address_text in MAP_CACHE:
+        print("MAP CACHE HIT")
+        return MAP_CACHE[address_text]
     if sync_playwright is None:
-        raise Exception(
-            "Playwright is not installed. Add playwright to requirements and install chromium in the build step."
-        )
-
-    lat, lon = geocode_address(address_text)
-    zoom = calc_zoom_from_target_width(lat, TARGET_HORIZONTAL_METERS, MAP_PIXEL_WIDTH)
-    target_url = build_govmap_map_url(address_text, zoom)
-
+        raise Exception("Playwright is not installed. Add playwright to requirements and install chromium in the build step.")
+    target_url = build_govmap_map_url(address_text)
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        page = browser.new_page(
-            viewport={"width": 1600, "height": 1000},
-            locale="he-IL",
-            device_scale_factor=1,
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        page = browser.new_page(viewport={"width": 1600, "height": 1000}, locale="he-IL", device_scale_factor=1)
         try:
             page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
             page.wait_for_timeout(7000)
             _dismiss_popups(page)
-
-            page.add_style_tag(content="""
-                header, nav, aside, footer,
-                [class*='header'], [class*='toolbar'], [class*='search'],
-                [class*='panel'], [class*='legend'], [class*='basemap'],
-                [class*='controls'], [class*='button'] {
-                    visibility: hidden !important;
-                }
-            """)
+            page.add_style_tag(content="header, nav, aside, footer, [class*='header'], [class*='toolbar'], [class*='search'], [class*='panel'], [class*='legend'], [class*='basemap'], [class*='controls'], [class*='button'] { visibility: hidden !important; }")
             page.wait_for_timeout(1500)
-
-            map_candidates = [
-                "#map",
-                "[id*='map']",
-                "canvas",
-                ".ol-viewport",
-                ".esri-view-root",
-            ]
-
-            screenshot_bytes = None
-            for selector in map_candidates:
+            for selector in ["#map", "[id*='map']", "canvas", ".ol-viewport", ".esri-view-root"]:
                 try:
                     locator = page.locator(selector).first
                     if locator.count() > 0:
@@ -467,16 +324,14 @@ def create_govmap_satellite_image(address_text: str) -> bytes:
                         if box and box["width"] > 500 and box["height"] > 300:
                             screenshot_bytes = locator.screenshot()
                             print("MAP SCREENSHOT SELECTOR:", selector)
-                            break
+                            MAP_CACHE[address_text] = screenshot_bytes
+                            return screenshot_bytes
                 except Exception:
                     continue
-
-            if screenshot_bytes is None:
-                screenshot_bytes = page.screenshot(full_page=False)
-                print("MAP SCREENSHOT FALLBACK: page.screenshot()")
-
+            screenshot_bytes = page.screenshot(full_page=False)
+            print("MAP SCREENSHOT FALLBACK: page.screenshot()")
+            MAP_CACHE[address_text] = screenshot_bytes
             return screenshot_bytes
-
         except PlaywrightTimeoutError as e:
             raise Exception(f"GovMap screenshot timeout: {str(e)}")
         finally:
@@ -530,12 +385,10 @@ def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}
             run.add_picture(io.BytesIO(map_bytes), width=Inches(MAP_WIDTH_INCHES), height=Inches(MAP_HEIGHT_INCHES))
             return True
         return False
-
     for paragraph in doc.paragraphs:
         if try_insert(paragraph):
             print("MAP INSERTED IN BODY")
             return True
-
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -543,14 +396,12 @@ def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}
                     if try_insert(paragraph):
                         print("MAP INSERTED IN TABLE")
                         return True
-
     for section in doc.sections:
         for part in (section.header, section.footer):
             for paragraph in part.paragraphs:
                 if try_insert(paragraph):
                     print("MAP INSERTED IN HEADER/FOOTER")
                     return True
-
     print("MAP PLACEHOLDER NOT FOUND")
     return False
 
@@ -559,7 +410,6 @@ def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
         replacements[placeholder] = data.get(col_id, "") or ""
-
     first_date = extract_first_date((data.get("dup__of_90__timeline", "") or "").strip()) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
     replacements["{{Date}}"] = first_date
     replacements["{{Hit date}}"] = format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
@@ -577,17 +427,10 @@ def create_report(data: dict):
     replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
-
-    address_text = " ".join([
-        (data.get("text_mm12vcy9", "") or "").strip(),
-        (data.get("text_mm12jf0w", "") or "").strip(),
-        (data.get("text_mm264acy", "") or "").strip(),
-    ]).strip()
-
+    address_text = " ".join([(data.get("text_mm12vcy9", "") or "").strip(), (data.get("text_mm12jf0w", "") or "").strip(), (data.get("text_mm264acy", "") or "").strip()]).strip()
     if address_text:
         map_bytes = create_govmap_satellite_image(address_text)
         replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
-
     buffer = io.BytesIO()
     doc.save(buffer)
     report_bytes = buffer.getvalue()
@@ -599,27 +442,19 @@ def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
     data = get_item_data(item_id)
     print("ITEM DATA:", data)
-
     project_name = (data.get("name", "") or "").strip() or f"project_{item_id}"
     city_name = (data.get(CITY_COLUMN_ID, "") or "").strip()
     if not city_name:
         raise Exception(f"City field is empty or missing (column id: {CITY_COLUMN_ID})")
-
     report_folder = f"{BASE_REPORTS_PATH}/{city_name}/{project_name}"
     photos_folder = f"{report_folder}/תמונות"
     findings_folder = f"{report_folder}/ממצאים ראשוניים + כ.כמויות"
-
     street = (data.get("text_mm12vcy9", "") or "").strip()
     number = (data.get("text_mm12jf0w", "") or "").strip()
     apartment = (data.get("text_mm127a33", "") or "").strip()
     report_date = extract_first_date((data.get("dup__of_90__timeline", "") or "").strip()) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
-
-    file_name = sanitize_filename(
-        f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
-        f"דירה {apartment}- {city_name}, {report_date}.docx"
-    )
+    file_name = sanitize_filename(f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - דירה {apartment}- {city_name}, {report_date}.docx")
     file_path = f"{findings_folder}/{file_name}"
-
     print("DROPBOX_SHARED_LINK:", DROPBOX_SHARED_LINK)
     print("SHARED_ROOT_PATH:", SHARED_ROOT_PATH)
     print("BASE_REPORTS_PATH:", BASE_REPORTS_PATH)
@@ -628,24 +463,18 @@ def process_item(item_id: int):
     print("PHOTOS FOLDER:", photos_folder)
     print("FINDINGS FOLDER:", findings_folder)
     print("FILE PATH:", file_path)
-
     create_folder_if_needed(report_folder)
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
-
     report_bytes, replacements = create_report(data)
-
     dbx.files_upload(report_bytes, file_path, mode=dropbox.files.WriteMode.overwrite, mute=True)
     print("FILE UPLOADED TO DROPBOX")
-
     link = get_or_create_shared_link(file_path)
-
     try:
         upload_file_to_monday(item_id=item_id, column_id=FILES_COLUMN_ID, file_name=file_name, file_bytes=report_bytes)
         print("FILE UPLOADED TO MONDAY FILES COLUMN")
     except Exception as e:
         print("MONDAY FILE UPLOAD FAILED - CONTINUING:", str(e))
-
     update_link_column(item_id=item_id, column_id=LINK_COLUMN_ID, url=link, text=file_name)
     print("DROPBOX LINK WRITTEN TO MONDAY LINK COLUMN")
     print("PROCESS SUCCESS. LINK:", link)
@@ -661,20 +490,12 @@ def home():
 def webhook():
     if request.method == "GET":
         return "Webhook endpoint is live", 200
-
     data = request.get_json(silent=True) or {}
     print("INCOMING DATA:", data)
-
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]}), 200
-
     try:
-        item_id = (
-            data.get("event", {}).get("pulseId")
-            or data.get("event", {}).get("itemId")
-            or data.get("pulseId")
-            or data.get("itemId")
-        )
+        item_id = (data.get("event", {}).get("pulseId") or data.get("event", {}).get("itemId") or data.get("pulseId") or data.get("itemId"))
         print("ITEM ID:", item_id)
         if not item_id:
             return jsonify({"error": "No item id found", "payload": data}), 400
