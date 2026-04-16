@@ -1,6 +1,6 @@
+playwright
 dropbox
 python-docx
 flask
 requests
 gunicorn
-Pillow
