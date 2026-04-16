@@ -2,13 +2,17 @@ import os
 import io
 import re
 import json
+import math
 from datetime import datetime
 from pathlib import PurePosixPath
+from urllib.parse import quote_plus
 
 import requests
 import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
+from docx.shared import Inches
+from PIL import Image, ImageDraw
 
 app = Flask(__name__)
 
@@ -37,6 +41,22 @@ ID_COLUMN_ID = "text_mm12vayb"
 REPORT_TYPE_COLUMN_ID = "color_mm12nfzt"
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# GovMap image settings
+GOVMAP_BASE_URL = "https://www.govmap.gov.il/"
+GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
+HTTP_USER_AGENT = os.environ.get("MAP_HTTP_USER_AGENT", "monday-dropbox-mvp1/1.0 (contact: admin)")
+MAP_WIDTH_INCHES = 6.5
+MAP_HEIGHT_INCHES = 4.4
+MAP_PIXEL_WIDTH = 1200
+MAP_PIXEL_HEIGHT = 812
+TARGET_HORIZONTAL_METERS = 50.0
+TOLERANCE_METERS = 5.0
+TILE_SIZE = 256
+SATELLITE_TILE_URL = (
+    "https://services.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
 
 COLUMN_MAP = {
     "{{Engineer}}": "text_mm12tcvb",
@@ -381,6 +401,128 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
+
+def geocode_address(address_text: str):
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    params = {
+        "q": address_text,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    response = requests.get(GEOCODER_URL, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+    results = response.json()
+    if not results:
+        raise Exception(f"Address not found by geocoder: {address_text}")
+    lat = float(results[0]["lat"])
+    lon = float(results[0]["lon"])
+    print("GEOCODE RESULT:", lat, lon)
+    return lat, lon
+
+
+def calc_zoom_for_horizontal_meters(lat: float, target_horizontal_meters: float, image_width_px: int) -> int:
+    meters_per_pixel = target_horizontal_meters / image_width_px
+    zoom = math.log2((156543.03392 * math.cos(math.radians(lat))) / meters_per_pixel)
+    zoom_int = max(1, min(22, int(round(zoom))))
+    print("TARGET WIDTH METERS:", target_horizontal_meters)
+    print("TOLERANCE METERS:", TOLERANCE_METERS)
+    print("CALCULATED ZOOM:", zoom_int)
+    return zoom_int
+
+
+def latlon_to_world_pixels(lat: float, lon: float, zoom: int):
+    scale = (2 ** zoom) * TILE_SIZE
+    x = (lon + 180.0) / 360.0 * scale
+    lat_rad = math.radians(lat)
+    y = ((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0) * scale
+    return x, y
+
+
+def fetch_tile(z: int, x: int, y: int) -> Image.Image:
+    url = SATELLITE_TILE_URL.format(z=z, y=y, x=x)
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+
+def build_satellite_map_image(address_text: str) -> bytes:
+    lat, lon = geocode_address(address_text)
+    zoom = calc_zoom_for_horizontal_meters(lat, TARGET_HORIZONTAL_METERS, MAP_PIXEL_WIDTH)
+
+    world_x, world_y = latlon_to_world_pixels(lat, lon, zoom)
+    center_tile_x = int(world_x // TILE_SIZE)
+    center_tile_y = int(world_y // TILE_SIZE)
+
+    grid = 5
+    half = grid // 2
+    stitched = Image.new("RGB", (grid * TILE_SIZE, grid * TILE_SIZE), "white")
+
+    for gx in range(grid):
+        for gy in range(grid):
+            tile_x = center_tile_x + (gx - half)
+            tile_y = center_tile_y + (gy - half)
+            tile_img = fetch_tile(zoom, tile_x, tile_y)
+            stitched.paste(tile_img, (gx * TILE_SIZE, gy * TILE_SIZE))
+
+    top_left_world_x = (center_tile_x - half) * TILE_SIZE
+    top_left_world_y = (center_tile_y - half) * TILE_SIZE
+    point_x = world_x - top_left_world_x
+    point_y = world_y - top_left_world_y
+
+    left = int(round(point_x - MAP_PIXEL_WIDTH / 2))
+    top = int(round(point_y - MAP_PIXEL_HEIGHT / 2))
+    left = max(0, min(left, stitched.width - MAP_PIXEL_WIDTH))
+    top = max(0, min(top, stitched.height - MAP_PIXEL_HEIGHT))
+
+    cropped = stitched.crop((left, top, left + MAP_PIXEL_WIDTH, top + MAP_PIXEL_HEIGHT))
+
+    marker_x = int(round(point_x - left))
+    marker_y = int(round(point_y - top))
+    draw = ImageDraw.Draw(cropped)
+    r = 16
+    draw.ellipse((marker_x - r, marker_y - r, marker_x + r, marker_y + r), fill=(220, 0, 0), outline=(255, 255, 255), width=3)
+    draw.line((marker_x, marker_y + r, marker_x, marker_y + r + 22), fill=(220, 0, 0), width=6)
+
+    out = io.BytesIO()
+    cropped.save(out, format="PNG")
+    print("SATELLITE MAP IMAGE CREATED")
+    return out.getvalue()
+
+
+def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}}"):
+    def try_insert(paragraph):
+        if placeholder in paragraph.text:
+            paragraph.text = paragraph.text.replace(placeholder, "")
+            run = paragraph.add_run()
+            run.add_picture(io.BytesIO(map_bytes), width=Inches(MAP_WIDTH_INCHES), height=Inches(MAP_HEIGHT_INCHES))
+            return True
+        return False
+
+    for paragraph in doc.paragraphs:
+        if try_insert(paragraph):
+            print("MAP INSERTED IN BODY")
+            return True
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if try_insert(paragraph):
+                        print("MAP INSERTED IN TABLE")
+                        return True
+
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for paragraph in part.paragraphs:
+                if try_insert(paragraph):
+                    print("MAP INSERTED IN HEADER/FOOTER")
+                    return True
+
+    print("MAP PLACEHOLDER NOT FOUND")
+    return False
+
 def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
@@ -394,6 +536,7 @@ def build_replacements(data: dict) -> dict:
     return replacements
 
 
+
 def create_report(data: dict):
     report_type_value = data.get(REPORT_TYPE_COLUMN_ID, "")
     template_path = build_template_path(report_type_value)
@@ -403,6 +546,17 @@ def create_report(data: dict):
     replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
+
+    address_text = " ".join([
+        (data.get("text_mm12vcy9", "") or "").strip(),
+        (data.get("text_mm12jf0w", "") or "").strip(),
+        (data.get("text_mm264acy", "") or "").strip(),
+    ]).strip()
+
+    if address_text:
+        map_bytes = build_satellite_map_image(address_text)
+        replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
+
     buffer = io.BytesIO()
     doc.save(buffer)
     report_bytes = buffer.getvalue()
