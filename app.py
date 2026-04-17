@@ -61,7 +61,7 @@ MAP_HEIGHT_INCHES = 4.4
 MAP_IMAGE_WIDTH = 640
 MAP_IMAGE_HEIGHT = 434
 
-TARGET_HORIZONTAL_METERS = 50.0
+TARGET_HORIZONTAL_METERS = 120.0
 
 MAPBOX_GEOCODE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
 # Satellite Streets is the closest stable "GovMap-like" default style in Mapbox.
@@ -385,7 +385,7 @@ def geocode_address_mapbox(address_text: str):
     if not features:
         raise Exception(f"Mapbox geocoding returned no results for address: {address_text}")
     lon, lat = features[0]["geometry"]["coordinates"]
-    print("MAPBOX GEOCODE LON/LAT:", lon, lat)
+    print("MAPBOX GEOCODE RESULT:", features[0])
     return float(lon), float(lat)
 
 
@@ -400,7 +400,7 @@ def calc_zoom_for_target_width(lat: float, image_width_px: int, target_width_m: 
 
 
 def build_mapbox_static_url(lon: float, lat: float, zoom: float) -> str:
-    overlay = f"pin-s+f00({lon},{lat})"
+    overlay = f"pin-xs+f00({lon},{lat})"
     return (
         f"{MAPBOX_STATIC_BASE}/{overlay}/{lon},{lat},{zoom}/"
         f"{MAP_IMAGE_WIDTH}x{MAP_IMAGE_HEIGHT}@2x"
