@@ -1,8 +1,7 @@
-import io
 import os
+import io
 import re
 import json
-import math
 from datetime import datetime
 from pathlib import PurePosixPath
 
@@ -10,7 +9,6 @@ import requests
 import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
-from docx.shared import Inches
 
 app = Flask(__name__)
 
@@ -22,14 +20,12 @@ DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET")
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-MAPBOX_ACCESS_TOKEN = os.environ.get("MAPBOX_ACCESS_TOKEN")
-
 LINK_COLUMN_ID = os.environ.get("LINK_COLUMN_ID", "link_mm27m1ce").strip()
 FILES_COLUMN_ID = "FILES"
 
 DROPBOX_SHARED_LINK = os.environ.get(
     "DROPBOX_SHARED_LINK",
-    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=o32icz46&dl=0",
+    "https://www.dropbox.com/scl/fo/5vychlhm7el3kjn5t8ah9/h?rlkey=fzledyaec01ixjsnd1zgbqoax&st=s94hoan7&dl=0",
 ).strip()
 
 TARGET_REPORTS_FOLDER_NAME = "20260228 - שאגת הארי"
@@ -54,28 +50,10 @@ COLUMN_MAP = {
     "{{ID}}": ID_COLUMN_ID,
 }
 
-MAP_WIDTH_INCHES = 6.5
-MAP_HEIGHT_INCHES = 4.4
-
-# Request image pixels. Mapbox @2x doubles these dimensions in output.
-MAP_IMAGE_WIDTH = 640
-MAP_IMAGE_HEIGHT = 434
-
-TARGET_HORIZONTAL_METERS = 50.0
-
-MAPBOX_GEOCODE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
-# Satellite Streets is the closest stable "GovMap-like" default style in Mapbox.
-MAPBOX_STYLE_PATH = "mapbox/satellite-streets-v12"
-MAPBOX_STATIC_BASE = f"https://api.mapbox.com/styles/v1/{MAPBOX_STYLE_PATH}/static"
-
-MAP_CACHE = {}
-
 if not MONDAY_API_KEY:
     raise ValueError("Missing MONDAY_API_KEY environment variable")
 if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
-if not MAPBOX_ACCESS_TOKEN:
-    raise ValueError("Missing MAPBOX_ACCESS_TOKEN environment variable")
 
 
 def init_dropbox():
@@ -173,8 +151,8 @@ def resolve_base_reports_and_template_dir(shared_root: str):
 
     if not template_dir:
         raise Exception(
-            "Could not resolve template directory from the shared link context. Checked: "
-            + " | ".join(template_candidates)
+            "Could not resolve template directory from the shared link context. "
+            + "Checked: " + " | ".join(template_candidates)
         )
 
     print("FINAL BASE_REPORTS_PATH:", base_reports_path)
@@ -205,7 +183,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -216,7 +194,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -237,7 +215,7 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         }
     })
 
-    query = """
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(
         board_id: $board_id,
@@ -247,7 +225,7 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
         id
       }
     }
-    """
+    '''
 
     result = monday_query(
         query,
@@ -262,13 +240,13 @@ def update_link_column(item_id: int, column_id: str, url: str, text: str):
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
+    '''
     data = {
         "query": query,
         "variables": json.dumps({
@@ -364,85 +342,20 @@ def build_template_path(report_type_value: str) -> str:
     return template_path
 
 
-def geocode_address_mapbox(address_text: str):
-    params = {
-        "q": address_text,
-        "country": "il",
-        "types": "address",
-        "limit": 1,
-        "access_token": MAPBOX_ACCESS_TOKEN,
-    }
-    response = requests.get(MAPBOX_GEOCODE_URL, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    features = payload.get("features", [])
-    if not features:
-        params.pop("types", None)
-        response = requests.get(MAPBOX_GEOCODE_URL, params=params, timeout=30)
-        response.raise_for_status()
-        payload = response.json()
-        features = payload.get("features", [])
-    if not features:
-        raise Exception(f"Mapbox geocoding returned no results for address: {address_text}")
-    lon, lat = features[0]["geometry"]["coordinates"]
-    print("MAPBOX GEOCODE LON/LAT:", lon, lat)
-    return float(lon), float(lat)
-
-
-def calc_zoom_for_target_width(lat: float, image_width_px: int, target_width_m: float) -> float:
-    total_pixels = image_width_px * 2  # because we request @2x
-    meters_per_pixel = target_width_m / total_pixels
-    zoom = math.log2((156543.03392 * math.cos(math.radians(lat))) / meters_per_pixel)
-    zoom = max(0.0, min(22.0, round(zoom, 2)))
-    print("MAPBOX TARGET WIDTH METERS:", target_width_m)
-    print("MAPBOX CALCULATED ZOOM:", zoom)
-    return zoom
-
-
-def build_mapbox_static_url(lon: float, lat: float, zoom: float) -> str:
-    overlay = f"pin-s+f00({lon},{lat})"
-    return (
-        f"{MAPBOX_STATIC_BASE}/{overlay}/{lon},{lat},{zoom}/"
-        f"{MAP_IMAGE_WIDTH}x{MAP_IMAGE_HEIGHT}@2x"
-        f"?access_token={MAPBOX_ACCESS_TOKEN}&logo=false&attribution=false"
-    )
-
-
-def create_mapbox_hybrid_image(address_text: str) -> bytes:
-    if address_text in MAP_CACHE:
-        print("MAP CACHE HIT")
-        return MAP_CACHE[address_text]
-
-    lon, lat = geocode_address_mapbox(address_text)
-    zoom = calc_zoom_for_target_width(lat, MAP_IMAGE_WIDTH, TARGET_HORIZONTAL_METERS)
-    url = build_mapbox_static_url(lon, lat, zoom)
-    print("MAPBOX STYLE:", MAPBOX_STYLE_PATH)
-    print("MAPBOX STATIC URL:", url.replace(MAPBOX_ACCESS_TOKEN, "***"))
-
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    image_bytes = response.content
-    MAP_CACHE[address_text] = image_bytes
-    return image_bytes
-
-
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
     full_text = "".join(run.text for run in paragraph.runs)
     if not full_text:
         return
-
     new_text = full_text
     changed = False
     for old, new in replacements.items():
         if old in new_text:
             new_text = new_text.replace(old, str(new))
             changed = True
-
     if not changed:
         return
-
     paragraph.runs[0].text = new_text
     for run in paragraph.runs[1:]:
         run.text = ""
@@ -468,39 +381,6 @@ def replace_everywhere(doc: Document, replacements: dict):
         replace_in_document_parts(section.footer, replacements)
 
 
-def replace_map_placeholder(doc: Document, map_bytes: bytes, placeholder="{{Map}}"):
-    def try_insert(paragraph):
-        if placeholder in paragraph.text:
-            paragraph.text = paragraph.text.replace(placeholder, "")
-            run = paragraph.add_run()
-            run.add_picture(io.BytesIO(map_bytes), width=Inches(MAP_WIDTH_INCHES), height=Inches(MAP_HEIGHT_INCHES))
-            return True
-        return False
-
-    for paragraph in doc.paragraphs:
-        if try_insert(paragraph):
-            print("MAP INSERTED IN BODY")
-            return True
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    if try_insert(paragraph):
-                        print("MAP INSERTED IN TABLE")
-                        return True
-
-    for section in doc.sections:
-        for part in (section.header, section.footer):
-            for paragraph in part.paragraphs:
-                if try_insert(paragraph):
-                    print("MAP INSERTED IN HEADER/FOOTER")
-                    return True
-
-    print("MAP PLACEHOLDER NOT FOUND")
-    return False
-
-
 def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
@@ -518,24 +398,11 @@ def create_report(data: dict):
     report_type_value = data.get(REPORT_TYPE_COLUMN_ID, "")
     template_path = build_template_path(report_type_value)
     print("DOWNLOADING TEMPLATE FROM:", template_path)
-
     _, res = dbx.files_download(template_path)
     doc = Document(io.BytesIO(res.content))
-
     replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
-
-    address_text = " ".join([
-        (data.get("text_mm12vcy9", "") or "").strip(),
-        (data.get("text_mm12jf0w", "") or "").strip(),
-        (data.get("text_mm264acy", "") or "").strip(),
-    ]).strip()
-
-    if address_text:
-        map_bytes = create_mapbox_hybrid_image(address_text)
-        replace_map_placeholder(doc, map_bytes, placeholder="{{Map}}")
-
     buffer = io.BytesIO()
     doc.save(buffer)
     report_bytes = buffer.getvalue()
@@ -626,7 +493,6 @@ def webhook():
         print("ITEM ID:", item_id)
         if not item_id:
             return jsonify({"error": "No item id found", "payload": data}), 400
-
         result = process_item(int(item_id))
         return jsonify({"status": "success", **result}), 200
     except Exception as e:
