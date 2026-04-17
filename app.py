@@ -1,3 +1,23 @@
+# --- Playwright Runtime Fix ---
+import subprocess
+import os
+
+def ensure_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+            print("Playwright already installed and working")
+    except Exception:
+        print("Installing Playwright Chromium at runtime...")
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            check=True
+        )
+
+ensure_playwright()
+
 import os
 import io
 import re
