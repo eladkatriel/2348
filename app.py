@@ -1,11 +1,9 @@
 import os
-# Must be set before importing playwright
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/.cache/ms-playwright"
 
 import io
 import re
 import json
-import subprocess
 from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import quote_plus
@@ -15,18 +13,12 @@ import dropbox
 from flask import Flask, request, jsonify
 from docx import Document
 from docx.shared import Inches
-
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-except Exception:
-    sync_playwright = None
-    PlaywrightTimeoutError = Exception
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 app = Flask(__name__)
 
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
 BOARD_ID = os.environ.get("BOARD_ID")
-
 DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET")
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN")
@@ -80,38 +72,21 @@ if not BOARD_ID:
     raise ValueError("Missing BOARD_ID environment variable")
 
 
-def ensure_playwright():
-    if sync_playwright is None:
-        raise RuntimeError("Playwright import failed")
-
+def get_playwright_executable() -> str:
     for executable in PLAYWRIGHT_EXECUTABLES:
         if os.path.exists(executable):
             print("PLAYWRIGHT EXECUTABLE FOUND:", executable)
             return executable
-
-    print("No known Playwright executable found. Installing Chromium at runtime...")
-    subprocess.run(
-        ["python", "-m", "playwright", "install", "chromium"],
-        check=False,
-    )
-
-    for executable in PLAYWRIGHT_EXECUTABLES:
-        if os.path.exists(executable):
-            print("PLAYWRIGHT EXECUTABLE FOUND AFTER INSTALL:", executable)
-            return executable
-
     raise FileNotFoundError(
-        "Playwright Chromium executable was not found after install. Checked: "
-        + " | ".join(PLAYWRIGHT_EXECUTABLES)
+        "Playwright Chromium executable not found. "
+        "Make sure build installs Chromium. Checked: " + " | ".join(PLAYWRIGHT_EXECUTABLES)
     )
 
 
 def init_dropbox():
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-            raise ValueError(
-                "Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET"
-            )
+            raise ValueError("Using DROPBOX_REFRESH_TOKEN requires DROPBOX_APP_KEY and DROPBOX_APP_SECRET")
         return dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=DROPBOX_APP_KEY,
@@ -120,9 +95,7 @@ def init_dropbox():
         )
     if DROPBOX_TOKEN:
         return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
-    raise ValueError(
-        "Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN"
-    )
+    raise ValueError("Missing Dropbox credentials. Set DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET, or DROPBOX_TOKEN")
 
 
 dbx = init_dropbox()
@@ -179,19 +152,14 @@ def resolve_base_reports_and_template_dir(shared_root: str):
     child_template_dir = f"{shared_root}/{TEMPLATE_RELATIVE_DIR}"
     direct_reports = shared_root
 
-    template_candidates = [
-        child_template_dir,
-        "/Template/23-48",
-    ]
+    template_candidates = [child_template_dir, "/Template/23-48"]
 
     if base_name == TARGET_REPORTS_FOLDER_NAME and path_exists(direct_reports):
         base_reports_path = direct_reports
     elif path_exists(child_reports):
         base_reports_path = child_reports
     else:
-        raise Exception(
-            f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}"
-        )
+        raise Exception(f"Could not resolve the reports root from the shared link. Checked: {direct_reports} | {child_reports}")
 
     template_dir = None
     for candidate in template_candidates:
@@ -200,10 +168,7 @@ def resolve_base_reports_and_template_dir(shared_root: str):
             break
 
     if not template_dir:
-        raise Exception(
-            "Could not resolve template directory from the shared link context. Checked: "
-            + " | ".join(template_candidates)
-        )
+        raise Exception("Could not resolve template directory from the shared link context. Checked: " + " | ".join(template_candidates))
 
     print("FINAL BASE_REPORTS_PATH:", base_reports_path)
     print("FINAL TEMPLATE_DIR:", template_dir)
@@ -233,7 +198,7 @@ def monday_query(query: str, variables=None):
 
 
 def get_item_data(item_id: int):
-    query = """
+    query = '''
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -244,7 +209,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    """
+    '''
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -258,61 +223,32 @@ def get_item_data(item_id: int):
 
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
-    column_values = json.dumps({
-        column_id: {
-            "url": url,
-            "text": text,
-        }
-    })
-
-    query = """
+    column_values = json.dumps({column_id: {"url": url, "text": text}})
+    query = '''
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
-      change_multiple_column_values(
-        board_id: $board_id,
-        item_id: $item_id,
-        column_values: $column_values
-      ) {
+      change_multiple_column_values(board_id: $board_id, item_id: $item_id, column_values: $column_values) {
         id
       }
     }
-    """
-
-    result = monday_query(
-        query,
-        {
-            "board_id": str(BOARD_ID),
-            "item_id": str(item_id),
-            "column_values": column_values,
-        },
-    )
+    '''
+    result = monday_query(query, {"board_id": str(BOARD_ID), "item_id": str(item_id), "column_values": column_values})
     print("LINK COLUMN UPDATE RESULT:", result)
     return result
 
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = """
+    query = '''
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
         id
       }
     }
-    """
-    data = {
-        "query": query,
-        "variables": json.dumps({
-            "item_id": str(item_id),
-            "column_id": column_id,
-        }),
-    }
-    files = {
-        "variables[file]": (file_name, file_bytes, DOCX_MIME),
-    }
+    '''
+    data = {"query": query, "variables": json.dumps({"item_id": str(item_id), "column_id": column_id})}
+    files = {"variables[file]": (file_name, file_bytes, DOCX_MIME)}
     response = requests.post(
         "https://api.monday.com/v2/file",
-        headers={
-            "Authorization": MONDAY_API_KEY,
-            "API-Version": "2026-04",
-        },
+        headers={"Authorization": MONDAY_API_KEY, "API-Version": "2026-04"},
         data=data,
         files=files,
         timeout=120,
@@ -347,7 +283,6 @@ def get_or_create_shared_link(file_path: str) -> str:
             return existing_links[0].url
     except Exception as e:
         print("SHARED LINK LOOKUP FAILED:", str(e))
-
     link = dbx.sharing_create_shared_link_with_settings(file_path).url
     print("NEW SHARE LINK CREATED:", link)
     return link
@@ -423,7 +358,7 @@ def create_govmap_satellite_image(address_text: str) -> bytes:
         print("MAP CACHE HIT")
         return MAP_CACHE[address_text]
 
-    executable_path = ensure_playwright()
+    executable_path = get_playwright_executable()
     print("PLAYWRIGHT EXECUTABLE:", executable_path)
 
     target_url = build_govmap_map_url(address_text)
@@ -440,11 +375,7 @@ def create_govmap_satellite_image(address_text: str) -> bytes:
                 "--single-process",
             ],
         )
-        page = browser.new_page(
-            viewport={"width": 1600, "height": 1000},
-            locale="he-IL",
-            device_scale_factor=1,
-        )
+        page = browser.new_page(viewport={"width": 1600, "height": 1000}, locale="he-IL", device_scale_factor=1)
         try:
             page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
             page.wait_for_timeout(7000)
@@ -479,7 +410,6 @@ def create_govmap_satellite_image(address_text: str) -> bytes:
 
             MAP_CACHE[address_text] = screenshot_bytes
             return screenshot_bytes
-
         except PlaywrightTimeoutError as e:
             raise Exception(f"GovMap screenshot timeout: {str(e)}")
         finally:
@@ -489,21 +419,17 @@ def create_govmap_satellite_image(address_text: str) -> bytes:
 def replace_in_paragraph(paragraph, replacements: dict):
     if not paragraph.text:
         return
-
     full_text = "".join(run.text for run in paragraph.runs)
     if not full_text:
         return
-
     new_text = full_text
     changed = False
     for old, new in replacements.items():
         if old in new_text:
             new_text = new_text.replace(old, str(new))
             changed = True
-
     if not changed:
         return
-
     paragraph.runs[0].text = new_text
     for run in paragraph.runs[1:]:
         run.text = ""
@@ -566,7 +492,6 @@ def build_replacements(data: dict) -> dict:
     replacements = {}
     for placeholder, col_id in COLUMN_MAP.items():
         replacements[placeholder] = data.get(col_id, "") or ""
-
     first_date = extract_first_date((data.get("dup__of_90__timeline", "") or "").strip()) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
     replacements["{{Date}}"] = first_date
     replacements["{{Hit date}}"] = format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
@@ -579,10 +504,8 @@ def create_report(data: dict):
     report_type_value = data.get(REPORT_TYPE_COLUMN_ID, "")
     template_path = build_template_path(report_type_value)
     print("DOWNLOADING TEMPLATE FROM:", template_path)
-
     _, res = dbx.files_download(template_path)
     doc = Document(io.BytesIO(res.content))
-
     replacements = build_replacements(data)
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
