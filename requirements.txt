@@ -1,6 +1,5 @@
-playwright
+flask
 dropbox
 python-docx
-flask
 requests
 gunicorn
