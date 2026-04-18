@@ -164,7 +164,7 @@ def monday_query(query: str, variables=None):
     return payload
 
 def get_item_data(item_id: int):
-    query = '''
+    query = """
     query ($item_ids: [ID!]) {
       items(ids: $item_ids) {
         id
@@ -175,7 +175,7 @@ def get_item_data(item_id: int):
         }
       }
     }
-    '''
+    """
     data = monday_query(query, {"item_ids": [str(item_id)]})
     items = data.get("data", {}).get("items", [])
     if not items:
@@ -188,21 +188,21 @@ def get_item_data(item_id: int):
 
 def update_link_column(item_id: int, column_id: str, url: str, text: str):
     column_values = json.dumps({column_id: {"url": url, "text": text}})
-    query = '''
+    query = """
     mutation ($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
       change_multiple_column_values(board_id: $board_id, item_id: $item_id, column_values: $column_values) { id }
     }
-    '''
+    """
     result = monday_query(query, {"board_id": str(BOARD_ID), "item_id": str(item_id), "column_values": column_values})
     print("LINK COLUMN UPDATE RESULT:", result)
     return result
 
 def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
-    query = '''
+    query = """
     mutation ($item_id: ID!, $column_id: String!, $file: File!) {
       add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) { id }
     }
-    '''
+    """
     data = {"query": query, "variables": json.dumps({"item_id": str(item_id), "column_id": column_id})}
     files = {"variables[file]": (file_name, file_bytes, DOCX_MIME)}
     response = requests.post("https://api.monday.com/v2/file", headers={"Authorization": MONDAY_API_KEY, "API-Version": "2026-04"}, data=data, files=files, timeout=120)
@@ -561,10 +561,7 @@ def process_item(item_id: int):
     apartment = (data.get("text_mm127a33", "") or "").strip()
     report_date = extract_first_date((data.get("dup__of_90__timeline", "") or "").strip()) or format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
 
-    file_name = sanitize_filename(
-        f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - "
-        f"דירה {apartment}- {city_name}, {report_date}.docx"
-    )
+    file_name = sanitize_filename(f"מימצאים מבניים והנחיות ראשוניות רחוב {street} {number} - דירה {apartment}- {city_name}, {report_date}.docx")
     file_path = f"{findings_folder}/{file_name}"
 
     print("DROPBOX_SHARED_LINK:", DROPBOX_SHARED_LINK)
