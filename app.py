@@ -48,14 +48,14 @@ COLUMN_MAP = {
 
 MAP_WIDTH_INCHES = 6.5
 MAP_HEIGHT_INCHES = 4.4
-MAP_IMAGE_WIDTH = 640
-MAP_IMAGE_HEIGHT = 434
-TARGET_HORIZONTAL_METERS = 300.0
+MAP_IMAGE_WIDTH = 1280
+MAP_IMAGE_HEIGHT = 868
+TARGET_HORIZONTAL_METERS = 200.0
 MAPBOX_GEOCODE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
 MAPBOX_STYLE_PATH = "mapbox/satellite-streets-v12"
 MAPBOX_STATIC_BASE = f"https://api.mapbox.com/styles/v1/{MAPBOX_STYLE_PATH}/static"
 MAP_MARKER_MODE = os.environ.get("MAP_MARKER_MODE", "small").strip().lower()
-MAP_NOT_FOUND_TEXT = "לא נמצא מפה תואמת לכתובת"
+MAP_NOT_FOUND_TEXT = "לא נמצאה מפה תואמת לכתובת"
 MAP_CACHE = {}
 
 if not MONDAY_API_KEY:
