@@ -44,6 +44,7 @@ COLUMN_MAP = {
     "{{City}}": CITY_COLUMN_ID,
     "{{Case}}": CASE_COLUMN_ID,
     "{{ID}}": ID_COLUMN_ID,
+    "{{Name}}": "text_mm12yqvr",
 }
 
 MAP_WIDTH_INCHES = 6.5
