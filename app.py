@@ -12,6 +12,241 @@ from flask import Flask, request, jsonify
 from docx import Document
 from docx.shared import Inches
 
+# ── Garmushka PDF ─────────────────────────────────────────────────────────────
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    HRFlowable, Image as RLImage, Paragraph,
+    SimpleDocTemplate, Spacer, Table, TableStyle,
+)
+
+_G_BLUE_DARK  = colors.HexColor("#0C447C")
+_G_BLUE_MID   = colors.HexColor("#378ADD")
+_G_BLUE_LIGHT = colors.HexColor("#E6F1FB")
+_G_GRAY_BG    = colors.HexColor("#F5F5F3")
+_G_GRAY_BDR   = colors.HexColor("#D3D1C7")
+_G_GRAY_TXT   = colors.HexColor("#444441")
+_G_GRAY_MUT   = colors.HexColor("#888780")
+_G_WHITE      = colors.white
+_G_PAGE_W, _G_PAGE_H = A4
+_G_MARGIN     = 2 * cm
+_G_FONT_NAME  = "Helvetica"   # ייעודי לגרמושקא — מוחלף ב-_g_init_font()
+
+def _g_init_font() -> str:
+    global _G_FONT_NAME
+    for path in [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont("GHEB", path))
+                _G_FONT_NAME = "GHEB"
+                return _G_FONT_NAME
+            except Exception:
+                pass
+    return _G_FONT_NAME
+
+_g_init_font()
+
+def _g_bidi(text: str) -> str:
+    """RTL rendering for Hebrew text in reportlab."""
+    if not text:
+        return ""
+    try:
+        from bidi.algorithm import get_display
+        return get_display(str(text))
+    except ImportError:
+        s = str(text)
+        return s[::-1] if any("\u0590" <= c <= "\u05FF" for c in s) else s
+
+def _g_styles() -> dict:
+    f = _G_FONT_NAME
+    return {
+        "title":    ParagraphStyle("gt",  fontName=f, fontSize=20, textColor=_G_BLUE_DARK,  alignment=2, leading=28),
+        "subtitle": ParagraphStyle("gs",  fontName=f, fontSize=13, textColor=_G_BLUE_DARK,  alignment=2, leading=20),
+        "section":  ParagraphStyle("gsc", fontName=f, fontSize=12, textColor=_G_BLUE_DARK,  alignment=2, leading=18, spaceBefore=10, spaceAfter=6),
+        "label":    ParagraphStyle("gl",  fontName=f, fontSize=9,  textColor=_G_GRAY_MUT,   alignment=2, leading=13),
+        "value":    ParagraphStyle("gv",  fontName=f, fontSize=13, textColor=_G_GRAY_TXT,   alignment=2, leading=18),
+        "small":    ParagraphStyle("gsm", fontName=f, fontSize=8,  textColor=_G_GRAY_MUT,   alignment=2, leading=12),
+        "mfb":      ParagraphStyle("gmf", fontName=f, fontSize=10, textColor=_G_GRAY_MUT,   alignment=1, leading=16),
+    }
+
+def _g_page_frame(c, doc):
+    c.saveState()
+    c.setStrokeColor(colors.HexColor("#B5D4F4"))
+    c.setLineWidth(0.5)
+    c.rect(_G_MARGIN*0.6, _G_MARGIN*0.6, _G_PAGE_W-_G_MARGIN*1.2, _G_PAGE_H-_G_MARGIN*1.2)
+    c.setFont("Helvetica", 8)
+    c.setFillColor(_G_GRAY_MUT)
+    c.drawCentredString(_G_PAGE_W/2, _G_MARGIN*0.3, str(doc.page))
+    c.restoreState()
+
+def _g_meta_grid(story, st, cells: list):
+    """מציג רשת של תאי label+value, שורות של 2."""
+    col_w = (_G_PAGE_W - 2*_G_MARGIN) / 2 - 4
+    for i in range(0, len(cells), 2):
+        pair = cells[i:i+2]
+        while len(pair) < 2:
+            pair.append(("", ""))
+        cell_tables = []
+        for label, value in pair:
+            ct = Table(
+                [[Paragraph(_g_bidi(label), st["label"])],
+                 [Paragraph(_g_bidi(str(value or "—")), st["value"])]],
+                colWidths=[col_w],
+            )
+            ct.setStyle(TableStyle([
+                ("BACKGROUND",    (0,0),(-1,-1), _G_GRAY_BG),
+                ("ALIGN",         (0,0),(-1,-1), "RIGHT"),
+                ("TOPPADDING",    (0,0),(-1,-1), 10),
+                ("BOTTOMPADDING", (0,0),(-1,-1), 10),
+                ("LEFTPADDING",   (0,0),(-1,-1), 12),
+                ("RIGHTPADDING",  (0,0),(-1,-1), 12),
+            ]))
+            cell_tables.append(ct)
+        row_tbl = Table([cell_tables], colWidths=[col_w+6, col_w+6])
+        row_tbl.setStyle(TableStyle([
+            ("LEFTPADDING",  (0,0),(-1,-1), 2),
+            ("RIGHTPADDING", (0,0),(-1,-1), 2),
+            ("VALIGN",       (0,0),(-1,-1), "TOP"),
+        ]))
+        story.append(row_tbl)
+        story.append(Spacer(1, 5))
+
+def build_garmushka_pdf(data: dict, map_bytes: bytes | None = None) -> bytes:
+    """
+    יוצר גרמושקא PDF ב-memory ומחזיר bytes.
+    data = אותו dict שמגיע מ-get_item_data() (עמודות Monday).
+    map_bytes = bytes של תמונת המפה שכבר נוצרה, או None.
+    """
+    buf = io.BytesIO()
+    st  = _g_styles()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=_G_MARGIN, leftMargin=_G_MARGIN,
+        topMargin=_G_MARGIN,   bottomMargin=_G_MARGIN,
+        title="גרמושקא — נסח מבנה",
+    )
+
+    # ── שליפת שדות ───────────────────────────────────────────────────────────
+    street    = (data.get("text_mm12vcy9",  "") or "").strip()
+    number    = (data.get("text_mm12jf0w",  "") or "").strip()
+    apartment = (data.get("text_mm127a33",  "") or "").strip()
+    city      = (data.get("text_mm264acy",  "") or "").strip()
+    engineer  = (data.get("text_mm12tcvb",  "") or "").strip()
+    case      = (data.get("text_mm12qp1q",  "") or "").strip()
+    id_num    = (data.get("text_mm12vayb",  "") or "").strip()
+    months    = (data.get("text_mm129ef8",  "") or "").strip()
+    hit_date  = format_yyyy_mm_dd_to_dd_mm_yyyy((data.get("date_mm1rnmvg", "") or "").strip())
+    rep_type  = (data.get(REPORT_TYPE_COLUMN_ID, "") or "").strip()
+
+    apt_part = f"דירה {apartment}" if apartment else ""
+    address  = " ".join(p for p in [f"רחוב {street}", number, apt_part, city] if p)
+
+    story = []
+
+    # ── כותרת ────────────────────────────────────────────────────────────────
+    header = Table(
+        [[Paragraph(_g_bidi("גרמושקא — נסח מבנה"), st["title"])],
+         [Paragraph(_g_bidi(address), st["subtitle"])]],
+        colWidths=[_G_PAGE_W - 2*_G_MARGIN],
+    )
+    header.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), _G_BLUE_LIGHT),
+        ("ALIGN",         (0,0),(-1,-1), "RIGHT"),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("TOPPADDING",    (0,0),(-1,-1), 14),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 14),
+        ("LEFTPADDING",   (0,0),(-1,-1), 18),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 18),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── נתוני מבנה ───────────────────────────────────────────────────────────
+    story.append(Paragraph(_g_bidi("נתוני מבנה"), st["section"]))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_G_BLUE_MID, spaceAfter=8))
+    _g_meta_grid(story, st, [
+        ("רחוב",         f"{street} {number}".strip()),
+        ("דירה",          apartment or "—"),
+        ("עיר",           city or "—"),
+        ("תאריך פגיעה",   hit_date or "—"),
+    ])
+    story.append(Spacer(1, 0.3*cm))
+
+    # ── נתוני תיק ────────────────────────────────────────────────────────────
+    story.append(Paragraph(_g_bidi("נתוני תיק"), st["section"]))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_G_BLUE_MID, spaceAfter=8))
+    _g_meta_grid(story, st, [
+        ("מהנדס",       engineer or "—"),
+        ("תיק",         case     or "—"),
+        ("ת.ז / ח.פ",  id_num   or "—"),
+        ("חודשים",      months   or "—"),
+    ])
+    if rep_type:
+        story.append(Spacer(1, 4))
+        rt = Table(
+            [[Paragraph(_g_bidi("סוג דו\"ח"), st["label"]),
+              Paragraph(_g_bidi(rep_type),    st["value"])]],
+            colWidths=[(_G_PAGE_W-2*_G_MARGIN)*0.3, (_G_PAGE_W-2*_G_MARGIN)*0.7],
+        )
+        rt.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,-1), _G_GRAY_BG),
+            ("ALIGN",         (0,0),(-1,-1), "RIGHT"),
+            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+            ("TOPPADDING",    (0,0),(-1,-1), 8),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 8),
+            ("LEFTPADDING",   (0,0),(-1,-1), 10),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 10),
+        ]))
+        story.append(rt)
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── מפה ──────────────────────────────────────────────────────────────────
+    story.append(Paragraph(_g_bidi("מפה"), st["section"]))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_G_BLUE_MID, spaceAfter=8))
+    avail_w  = _G_PAGE_W - 2*_G_MARGIN
+    map_h    = 9*cm
+    if map_bytes:
+        try:
+            img = RLImage(io.BytesIO(map_bytes), width=avail_w, height=map_h)
+            img.hAlign = "CENTER"
+            story.append(img)
+        except Exception as e:
+            print("GARMUSHKA MAP IMAGE FAILED:", e)
+            map_bytes = None   # fall through to text fallback
+    if not map_bytes:
+        fb = Table(
+            [[Paragraph(_g_bidi(MAP_NOT_FOUND_TEXT), st["mfb"])]],
+            colWidths=[avail_w], rowHeights=[map_h],
+        )
+        fb.setStyle(TableStyle([
+            ("BACKGROUND", (0,0),(-1,-1), _G_GRAY_BG),
+            ("ALIGN",      (0,0),(-1,-1), "CENTER"),
+            ("VALIGN",     (0,0),(-1,-1), "MIDDLE"),
+            ("BOX",        (0,0),(-1,-1), 0.5, _G_GRAY_BDR),
+        ]))
+        story.append(fb)
+
+    # ── כותרת תחתונה ─────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.6*cm))
+    story.append(HRFlowable(width="100%", thickness=0.3, color=_G_GRAY_MUT, spaceAfter=4))
+    story.append(Paragraph(_g_bidi(f"תאריך הפקה: {datetime.now().strftime('%d.%m.%Y')}"), st["small"]))
+    story.append(Paragraph(
+        _g_bidi("המידע נשאב ממאגרי מידע ממשלתיים ועירוניים. יש לאמת מול הרשות המקומית לפני שימוש משפטי."),
+        st["small"],
+    ))
+
+    doc.build(story, onFirstPage=_g_page_frame, onLaterPages=_g_page_frame)
+    return buf.getvalue()
+
 app = Flask(__name__)
 
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY")
@@ -527,6 +762,7 @@ def create_report(data: dict):
     number = (data.get("text_mm12jf0w", "") or "").strip()
     city = (data.get("text_mm264acy", "") or "").strip()
 
+    map_bytes = None  # נשמר לשימוש חוזר בגרמושקא — ללא קריאה כפולה ל-Mapbox
     if street and number and city:
         try:
             map_bytes = create_mapbox_hybrid_image(street, number, city)
@@ -541,7 +777,7 @@ def create_report(data: dict):
     doc.save(buffer)
     report_bytes = buffer.getvalue()
     print("REPORT CREATED IN MEMORY")
-    return report_bytes, replacements
+    return report_bytes, replacements, map_bytes  # map_bytes מועבר הלאה לגרמושקא
 
 def process_item(item_id: int):
     print("START process_item with item_id:", item_id)
@@ -578,7 +814,7 @@ def process_item(item_id: int):
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
 
-    report_bytes, replacements = create_report(data)
+    report_bytes, replacements, map_bytes = create_report(data)
 
     dbx.files_upload(report_bytes, file_path, mode=dropbox.files.WriteMode.overwrite, mute=True)
     print("FILE UPLOADED TO DROPBOX")
@@ -593,6 +829,37 @@ def process_item(item_id: int):
 
     update_link_column(item_id=item_id, column_id=LINK_COLUMN_ID, url=link, text=file_name)
     print("DROPBOX LINK WRITTEN TO MONDAY LINK COLUMN")
+
+    # ── גרמושקא PDF ───────────────────────────────────────────────────────────
+    # נוצרת מיד אחרי ה-Word, עם אותם נתונים ואותה תמונת מפה (ללא קריאה נוספת ל-Mapbox)
+    try:
+        garmushka_bytes = build_garmushka_pdf(data, map_bytes=map_bytes)
+        garmushka_filename = sanitize_filename(
+            f"גרמושקא רחוב {street} {number}"
+            + (f" דירה {apartment}" if apartment else "")
+            + f" {city_name}, {report_date}.pdf"
+        )
+        garmushka_path = f"{findings_folder}/{garmushka_filename}"
+
+        dbx.files_upload(garmushka_bytes, garmushka_path, mode=dropbox.files.WriteMode.overwrite, mute=True)
+        print("GARMUSHKA UPLOADED TO DROPBOX:", garmushka_path)
+
+        try:
+            upload_file_to_monday(
+                item_id=item_id,
+                column_id=FILES_COLUMN_ID,
+                file_name=garmushka_filename,
+                file_bytes=garmushka_bytes,
+            )
+            print("GARMUSHKA UPLOADED TO MONDAY FILES COLUMN")
+        except Exception as e:
+            print("GARMUSHKA MONDAY FILE UPLOAD FAILED - CONTINUING:", str(e))
+
+    except Exception as e:
+        # הגרמושקא לא מפילה את כל התהליך
+        print("GARMUSHKA GENERATION FAILED - CONTINUING:", str(e))
+    # ── /גרמושקא ─────────────────────────────────────────────────────────────
+
     print("PROCESS SUCCESS. LINK:", link)
     return {"link": link, "file_name": file_name, "replacements": replacements}
 
