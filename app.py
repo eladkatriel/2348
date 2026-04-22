@@ -748,15 +748,25 @@ def build_replacements(data: dict) -> dict:
     replacements["{{ProjectName}}"] = data.get("name", "") or ""
     return replacements
 
-def create_report(data: dict):
+def create_report(data: dict, garmushka_pdf_data: dict = None):
     report_type_value = data.get(REPORT_TYPE_COLUMN_ID, "")
     template_path = build_template_path(report_type_value)
     print("DOWNLOADING TEMPLATE FROM:", template_path)
     _, res = dbx.files_download(template_path)
     doc = Document(io.BytesIO(res.content))
     replacements = build_replacements(data)
+    if garmushka_pdf_data:
+        if garmushka_pdf_data.get("date"):
+            replacements["{{YearBuilt}}"] = garmushka_pdf_data["date"][:4]
+            replacements["{{DateBuilt}}"] = garmushka_pdf_data["date"]
     print("REPLACEMENTS:", replacements)
     replace_everywhere(doc, replacements)
+    if garmushka_pdf_data:
+        try:
+            from garmushka_word_injector import inject_into_word
+            inject_into_word(doc, garmushka_pdf_data)
+        except Exception as e:
+            print("GARMUSHKA IMAGE INJECTION FAILED - CONTINUING:", str(e))
 
     street = (data.get("text_mm12vcy9", "") or "").strip()
     number = (data.get("text_mm12jf0w", "") or "").strip()
@@ -814,7 +824,28 @@ def process_item(item_id: int):
     create_folder_if_needed(photos_folder)
     create_folder_if_needed(findings_folder)
 
-    report_bytes, replacements, map_bytes = create_report(data)
+    # ── חיפוש PDF גרמושקא בתיקיית הפרויקט ב-Dropbox ─────────────────────────
+    # אם קיים PDF עם "היתר"/"הגשה"/"גרמושקא" בשם — מורידים, מנתחים, ומכניסים
+    # לקובץ ה-Word לפני ההעלאה
+    garmushka_pdf_data = None
+    tmp_dir = None
+    try:
+        from garmushka_word_injector import find_garmushka_pdfs_in_dropbox, download_and_analyze
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="garm_analyze_")
+        pdf_paths = find_garmushka_pdfs_in_dropbox(dbx, report_folder)
+        if pdf_paths:
+            print(f"FOUND {len(pdf_paths)} GARMUSHKA PDF(S) IN PROJECT FOLDER")
+            # נתח את הראשון שנמצא (בדרך כלל יש רק אחד)
+            garmushka_pdf_data = download_and_analyze(dbx, pdf_paths[0], tmp_dir)
+            print("GARMUSHKA PDF ANALYSIS:", garmushka_pdf_data)
+        else:
+            print("NO GARMUSHKA PDFs FOUND IN PROJECT FOLDER — SKIPPING INJECTION")
+    except Exception as e:
+        print("GARMUSHKA PDF ANALYSIS FAILED - CONTINUING:", str(e))
+    # ─────────────────────────────────────────────────────────────────────────
+
+    report_bytes, replacements, map_bytes = create_report(data, garmushka_pdf_data=garmushka_pdf_data)
 
     dbx.files_upload(report_bytes, file_path, mode=dropbox.files.WriteMode.overwrite, mute=True)
     print("FILE UPLOADED TO DROPBOX")
