@@ -3,3 +3,5 @@ dropbox
 python-docx
 requests
 gunicorn
+reportlab==4.1.0
+python-bidi==0.4.2
