@@ -1,7 +1,11 @@
 flask
+gunicorn
+requests
 dropbox
 python-docx
-requests
-gunicorn
+Pillow
+pypdf
 reportlab==4.1.0
 python-bidi==0.4.2
+httpx==0.27.0
+numpy
