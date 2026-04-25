@@ -825,24 +825,51 @@ def process_item(item_id: int):
     create_folder_if_needed(findings_folder)
 
     # ── חיפוש PDF גרמושקא בתיקיית הפרויקט ב-Dropbox ─────────────────────────
-    # אם קיים PDF עם "היתר"/"הגשה"/"גרמושקא" בשם — מורידים, מנתחים, ומכניסים
-    # לקובץ ה-Word לפני ההעלאה
+    # מחפש כל PDF בתיקיית הפרויקט (כולל שמות מספריים כמו 00015775.pdf).
+    # אם לא נמצא — הדו"ח נוצר בלעדיו (fallback-safe).
     garmushka_pdf_data = None
     tmp_dir = None
     try:
         from garmushka_word_injector import find_garmushka_pdfs_in_dropbox, download_and_analyze
         import tempfile
         tmp_dir = tempfile.mkdtemp(prefix="garm_analyze_")
-        pdf_paths = find_garmushka_pdfs_in_dropbox(dbx, report_folder)
-        if pdf_paths:
-            print(f"FOUND {len(pdf_paths)} GARMUSHKA PDF(S) IN PROJECT FOLDER")
-            # נתח את הראשון שנמצא (בדרך כלל יש רק אחד)
-            garmushka_pdf_data = download_and_analyze(dbx, pdf_paths[0], tmp_dir)
-            print("GARMUSHKA PDF ANALYSIS:", garmushka_pdf_data)
+        # שלב 1 — ניסיון הורדה אוטומטית מאתר העירייה
+        from building_permit_scraper import download_building_permit
+        pdf_bytes_dl, pdf_filename_dl = download_building_permit(
+            street=street, number=number, city=city_name
+        )
+        if pdf_bytes_dl:
+            # שמור ב-Dropbox לשימוש עתידי
+            dl_dropbox_path = f"{report_folder}/{pdf_filename_dl}"
+            try:
+                dbx.files_upload(pdf_bytes_dl, dl_dropbox_path,
+                                 mode=dropbox.files.WriteMode.overwrite, mute=True)
+                print(f"PERMIT PDF SAVED TO DROPBOX: {dl_dropbox_path}")
+            except Exception as e:
+                print(f"PERMIT PDF DROPBOX SAVE FAILED: {e}")
+            # שמור מקומית לניתוח
+            local_pdf = os.path.join(tmp_dir, pdf_filename_dl)
+            with open(local_pdf, 'wb') as f_:
+                f_.write(pdf_bytes_dl)
+            from garmushka_pdf_analyzer import analyze_building_pdf
+            garmushka_pdf_data = analyze_building_pdf(local_pdf, output_dir=tmp_dir)
+            print(f"AUTO-DOWNLOAD ANALYSIS: date={garmushka_pdf_data.get('date')}, "
+                  f"typical_floor={bool(garmushka_pdf_data.get('typical_floor_image'))}, "
+                  f"section={bool(garmushka_pdf_data.get('section_image'))}")
         else:
-            print("NO GARMUSHKA PDFs FOUND IN PROJECT FOLDER — SKIPPING INJECTION")
+            # שלב 2 — fallback: חיפוש PDF שהועלה ידנית ל-Dropbox
+            print(f"AUTO-DOWNLOAD FAILED — searching Dropbox: {report_folder}")
+            pdf_paths = find_garmushka_pdfs_in_dropbox(dbx, report_folder)
+            if pdf_paths:
+                print(f"ANALYZING EXISTING PDF: {pdf_paths[0]}")
+                garmushka_pdf_data = download_and_analyze(dbx, pdf_paths[0], tmp_dir)
+                print(f"ANALYSIS DONE: date={garmushka_pdf_data.get('date')}, "
+                      f"typical_floor={bool(garmushka_pdf_data.get('typical_floor_image'))}, "
+                      f"section={bool(garmushka_pdf_data.get('section_image'))}")
+            else:
+                print(f"NO PDF FOUND — report will be created without building plans")
     except Exception as e:
-        print("GARMUSHKA PDF ANALYSIS FAILED - CONTINUING:", str(e))
+        print(f"GARMUSHKA PDF ANALYSIS FAILED - CONTINUING: {str(e)}")
     # ─────────────────────────────────────────────────────────────────────────
 
     report_bytes, replacements, map_bytes = create_report(data, garmushka_pdf_data=garmushka_pdf_data)
@@ -876,12 +903,9 @@ def process_item(item_id: int):
         print("GARMUSHKA UPLOADED TO DROPBOX:", garmushka_path)
 
         try:
-            upload_file_to_monday(
-                item_id=item_id,
-                column_id=FILES_COLUMN_ID,
-                file_name=garmushka_filename,
-                file_bytes=garmushka_bytes,
-            )
+            # העלאת PDF ל-Monday עם MIME type נכון
+            _upload_pdf_to_monday(item_id=item_id, column_id=FILES_COLUMN_ID,
+                                  file_name=garmushka_filename, file_bytes=garmushka_bytes)
             print("GARMUSHKA UPLOADED TO MONDAY FILES COLUMN")
         except Exception as e:
             print("GARMUSHKA MONDAY FILE UPLOAD FAILED - CONTINUING:", str(e))
