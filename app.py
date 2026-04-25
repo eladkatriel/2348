@@ -448,6 +448,26 @@ def upload_file_to_monday(item_id: int, column_id: str, file_name: str, file_byt
         raise Exception(f"monday file upload error: {payload['errors']}")
     return payload
 
+def _upload_pdf_to_monday(item_id: int, column_id: str, file_name: str, file_bytes: bytes):
+    """העלאת PDF ל-Monday עם MIME type נכון (application/pdf)."""
+    query = """
+    mutation ($item_id: ID!, $column_id: String!, $file: File!) {
+      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) { id }
+    }
+    """
+    data = {"query": query, "variables": json.dumps({"item_id": str(item_id), "column_id": column_id})}
+    files = {"variables[file]": (file_name, file_bytes, "application/pdf")}
+    response = requests.post(
+        "https://api.monday.com/v2/file",
+        headers={"Authorization": MONDAY_API_KEY, "API-Version": "2026-04"},
+        data=data, files=files, timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if "errors" in payload:
+        raise Exception(f"monday PDF upload error: {payload['errors']}")
+    return payload
+
 def sanitize_filename(name: str) -> str:
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for ch in invalid_chars:
