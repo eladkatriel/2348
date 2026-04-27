@@ -1,43 +1,24 @@
 """
 building_permit_scraper.py
 ===========================
-מוריד אוטומטית PDF של תיק בניין מאתר העירייה הרלוונטית.
+מוריד אוטומטית PDF של תיק בניין מאתר העירייה — דרך Playwright (דפדפן אמיתי).
 
-תומך ב:
-  - קומפלוט (COMPLOT) — ~30 עיריות
-  - Bartech (ערד)
-  - תל אביב (TAVAPP)
+הגדרת Render — Build Command:
+  pip install -r requirements.txt && playwright install chromium --with-deps
 
-שימוש:
-    from building_permit_scraper import download_building_permit
-
-    pdf_bytes, filename = download_building_permit(
-        street="הארזים", number="29", city="בית שמש"
-    )
-    # pdf_bytes = bytes של ה-PDF, filename = שם הקובץ
-    # מחזיר (None, None) אם לא נמצא
+תומך ב: קומפלוט (~30 עיריות), Bartech (ערד), תל אביב
 """
 
-import io
 import os
 import time
-import asyncio
-import httpx
 from typing import Optional, Tuple
 from israeli_municipalities_db import get_scraper_info
 
+PRIORITY_KEYWORDS = [
+    "היתר", "גרמושקא", "גרמושקה", "הגשה", "תכנית", "קומה", "חתך",
+    "permit", "plan", "drawing",
+]
 
-TIMEOUT = 20
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def download_building_permit(
     street: str,
@@ -46,302 +27,307 @@ def download_building_permit(
     prefer_oldest: bool = True,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    מוריד PDF של תיק בניין (היתר/גרמושקא) לפי כתובת.
-
-    מחזיר (pdf_bytes, filename) או (None, None) אם לא נמצא.
-    prefer_oldest=True → מחזיר את התיק הישן ביותר (בנייה מקורית).
+    מוריד PDF של תיק בניין לפי כתובת.
+    מחזיר (pdf_bytes, filename) או (None, None).
     """
     info = get_scraper_info(city)
     if not info["found"] or not info["can_scrape"]:
-        print(f"[Scraper] {city} — אין מערכת דיגיטלית זמינה ({info.get('system')})")
+        print(f"[Scraper] {city} — אין מערכת דיגיטלית ({info.get('system')})")
         return None, None
 
-    system = info["system"]
-    print(f"[Scraper] חיפוש: {street} {number}, {city} | מערכת: {system}")
+    system   = info["system"]
+    api_base = info["api_base"]
+    print(f"[Scraper] מחפש: {street} {number}, {city} | מערכת: {system}")
 
     try:
         if system == "COMPLOT":
-            return _scrape_complot(info["api_base"], street, number, city, prefer_oldest)
+            return _scrape_complot(api_base, street, number, prefer_oldest)
         elif system == "BARTECH":
-            return _scrape_bartech(info["api_base"], street, number, city)
+            return _scrape_bartech(api_base, street, number)
         elif system == "TAVAPP":
             return _scrape_tel_aviv(street, number, prefer_oldest)
     except Exception as e:
-        print(f"[Scraper] שגיאה: {e}")
+        print(f"[Scraper] שגיאה: {type(e).__name__}: {e}")
     return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPLOT scraper (~30 עיריות)
+# Playwright browser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scrape_complot(
-    api_base: str,
-    street: str,
-    number: str,
-    city: str,
-    prefer_oldest: bool,
-) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    קומפלוט API:
-    1. GET /api/Buildings/GetBuildingsByAddress?street=X&houseNum=Y → רשימת בניינים
-    2. GET /api/Buildings/GetBuildingFiles?buildingId=Z            → רשימת קבצים
-    3. GET /api/Files/DownloadFile?fileId=W                        → הורדת PDF
-    """
-    with httpx.Client(headers=HEADERS, timeout=TIMEOUT, follow_redirects=True) as client:
+def _launch():
+    """מאתחל Playwright ומחזיר (pw, browser)."""
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-setuid-sandbox",
+              "--disable-dev-shm-usage", "--disable-gpu"],
+    )
+    return pw, browser
 
-        # שלב 1 — חיפוש בניין
-        resp = client.get(
+
+def _page(browser):
+    """פותח context + page עם locale עברי."""
+    ctx = browser.new_context(
+        locale="he-IL",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        accept_downloads=True,
+    )
+    p = ctx.new_page()
+    p.set_default_timeout(20000)
+    return p, ctx
+
+
+def _try_fill(page, selectors: list, value: str) -> bool:
+    for sel in selectors:
+        try:
+            page.fill(sel, value, timeout=3000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _try_click(page, selectors: list) -> bool:
+    for sel in selectors:
+        try:
+            page.click(sel, timeout=3000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _download_pdf(page) -> Tuple[Optional[bytes], Optional[str]]:
+    """מנסה למצוא כפתור הורדה ולהוריד PDF."""
+    selectors = [
+        "a[href*='.pdf']",
+        "button:has-text('הורד')",
+        "a:has-text('הורד')",
+        "button:has-text('PDF')",
+        "a:has-text('PDF')",
+        "[title*='הורד']",
+        ".download-btn",
+        "[class*='download']",
+    ]
+    for sel in selectors:
+        try:
+            with page.expect_download(timeout=15000) as dl_info:
+                page.click(sel, timeout=4000)
+            dl = dl_info.value
+            tmp = dl.path()
+            if tmp:
+                with open(tmp, "rb") as f:
+                    data = f.read()
+                if len(data) > 500:
+                    name = dl.suggested_filename or "building.pdf"
+                    print(f"[Scraper] ✓ הורד PDF: {name} ({len(data):,} bytes)")
+                    return data, name
+        except Exception:
+            continue
+    return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPLOT — ~30 עיריות
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scrape_complot(api_base, street, number, prefer_oldest):
+    search_url = f"{api_base}/newengine/Pages/buildings2.aspx"
+    print(f"[Complot] {search_url}")
+    pw, browser = _launch()
+    try:
+        page, ctx = _page(browser)
+
+        # ── נסיון 1: API ישיר דרך playwright request (עוקף DNS של Render) ──
+        for ep in [
             f"{api_base}/api/Buildings/GetBuildingsByAddress",
-            params={"street": street, "houseNum": number},
-        )
-        if resp.status_code != 200:
-            # נסיון עם endpoint חלופי
-            resp = client.get(
-                f"{api_base}/newengine/api/Buildings/GetBuildingsByAddress",
-                params={"street": street, "houseNum": number},
-            )
-        if resp.status_code != 200:
-            print(f"[Complot] חיפוש נכשל: {resp.status_code}")
-            return None, None
+            f"{api_base}/newengine/api/Buildings/GetBuildingsByAddress",
+        ]:
+            try:
+                r = page.request.get(ep, params={"street": street, "houseNum": number})
+                if r.ok:
+                    buildings = r.json()
+                    if buildings:
+                        print(f"[Complot] API: {len(buildings)} בניינים")
+                        result = _complot_api_download(page, api_base, buildings[0], prefer_oldest)
+                        if result[0]:
+                            return result
+            except Exception as e:
+                print(f"[Complot] API {ep}: {e}")
 
-        buildings = resp.json()
-        if not buildings:
-            print(f"[Complot] לא נמצאו בניינים עבור {street} {number} ב{city}")
-            return None, None
+        # ── נסיון 2: דפדפן מלא ────────────────────────────────────────────
+        page.on("download", lambda d: None)  # מאפשר downloads
+        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
 
-        print(f"[Complot] נמצאו {len(buildings)} בניינים")
-        building = buildings[0]
-        building_id = building.get("id") or building.get("BuildingId") or building.get("buildingId")
-        if not building_id:
-            print(f"[Complot] לא נמצא buildingId: {building}")
-            return None, None
+        _try_fill(page, [
+            "input[placeholder*='רחוב']", "input[placeholder*='street']",
+            "#streetInput", "#street", "input[name='street']",
+        ], street)
 
-        # שלב 2 — רשימת קבצים
-        resp2 = client.get(
-            f"{api_base}/api/Buildings/GetBuildingFiles",
-            params={"buildingId": building_id},
-        )
-        if resp2.status_code != 200:
-            resp2 = client.get(
-                f"{api_base}/newengine/api/Buildings/GetBuildingFiles",
-                params={"buildingId": building_id},
-            )
-        if resp2.status_code != 200:
-            print(f"[Complot] רשימת קבצים נכשלה: {resp2.status_code}")
-            return None, None
+        _try_fill(page, [
+            "input[placeholder*='מספר']", "input[placeholder*='number']",
+            "#houseNumInput", "#houseNum", "input[name='houseNum']",
+        ], number)
 
-        files = resp2.json()
-        if not files:
-            print(f"[Complot] לא נמצאו קבצים לבניין {building_id}")
-            return None, None
+        _try_click(page, [
+            "button:has-text('חיפוש')", "input[type='submit']",
+            "#searchBtn", "button[type='submit']",
+        ])
+        time.sleep(3)
 
-        print(f"[Complot] נמצאו {len(files)} קבצים")
+        # לחיצה על תוצאה ראשונה
+        _try_click(page, [
+            ".building-row:first-child", "tr:nth-child(2) td",
+            ".result-row:first-child", "tbody tr:first-child",
+        ])
+        time.sleep(2)
 
-        # בחירת קובץ — העדפה: היתר/גרמושקא/תוכנית. ישן ביותר = בנייה מקורית
-        target = _pick_best_file(files, prefer_oldest)
-        if not target:
-            print("[Complot] לא נמצא קובץ מתאים")
-            return None, None
+        return _download_pdf(page)
 
-        file_id = target.get("id") or target.get("FileId") or target.get("fileId")
-        filename = target.get("fileName") or target.get("FileName") or f"building_{building_id}.pdf"
-        print(f"[Complot] מוריד: {filename} (id={file_id})")
-
-        # שלב 3 — הורדת PDF
-        resp3 = client.get(
-            f"{api_base}/api/Files/DownloadFile",
-            params={"fileId": file_id},
-        )
-        if resp3.status_code != 200:
-            resp3 = client.get(
-                f"{api_base}/newengine/api/Files/DownloadFile",
-                params={"fileId": file_id},
-            )
-        if resp3.status_code == 200 and len(resp3.content) > 1000:
-            print(f"[Complot] ✓ הורד {len(resp3.content):,} bytes")
-            return resp3.content, filename
-        else:
-            print(f"[Complot] הורדה נכשלה: {resp3.status_code}")
-            return None, None
+    finally:
+        browser.close()
+        pw.stop()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BARTECH scraper (ערד)
-# ─────────────────────────────────────────────────────────────────────────────
+def _complot_api_download(page, api_base, building, prefer_oldest):
+    """הורדת קובץ ספציפי דרך API אחרי שמצאנו building."""
+    bid = (building.get("id") or building.get("BuildingId")
+           or building.get("buildingId") or building.get("ID"))
+    if not bid:
+        return None, None
 
-def _scrape_bartech(
-    api_base: str,
-    street: str,
-    number: str,
-    city: str,
-) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Bartech API (ערד):
-    POST /api/PermitApplication/Search  { streetName, houseNumber }
-    → רשימת בקשות
-    GET  /api/PermitApplication/{id}/Documents → רשימת מסמכים
-    GET  /api/Document/{docId}/Download        → PDF
-    """
-    with httpx.Client(headers=HEADERS, timeout=TIMEOUT, follow_redirects=True) as client:
-
-        # שלב 1 — חיפוש
-        resp = client.post(
-            f"{api_base}/api/PermitApplication/Search",
-            json={"streetName": street, "houseNumber": number},
-        )
-        if resp.status_code != 200:
-            # נסיון GET
-            resp = client.get(
-                f"{api_base}/api/PermitApplication/Search",
-                params={"streetName": street, "houseNumber": number},
-            )
-        if resp.status_code != 200:
-            print(f"[Bartech] חיפוש נכשל: {resp.status_code}")
-            return None, None
-
-        results = resp.json()
-        if not results:
-            print(f"[Bartech] לא נמצאו תוצאות עבור {street} {number}")
-            return None, None
-
-        app_id = (results[0].get("id") or results[0].get("applicationId")
-                  or results[0].get("Id"))
-        if not app_id:
-            print(f"[Bartech] לא נמצא ID: {results[0]}")
-            return None, None
-
-        print(f"[Bartech] נמצאה בקשה: {app_id}")
-
-        # שלב 2 — מסמכים
-        resp2 = client.get(f"{api_base}/api/PermitApplication/{app_id}/Documents")
-        if resp2.status_code != 200:
-            print(f"[Bartech] רשימת מסמכים נכשלה: {resp2.status_code}")
-            return None, None
-
-        docs = resp2.json()
-        if not docs:
-            print(f"[Bartech] לא נמצאו מסמכים")
-            return None, None
-
-        target = _pick_best_file(docs, prefer_oldest=True)
-        if not target:
-            target = docs[0]
-
-        doc_id = target.get("id") or target.get("documentId") or target.get("Id")
-        filename = target.get("fileName") or target.get("name") or f"arad_{app_id}.pdf"
-
-        # שלב 3 — הורדה
-        resp3 = client.get(f"{api_base}/api/Document/{doc_id}/Download")
-        if resp3.status_code == 200 and len(resp3.content) > 1000:
-            print(f"[Bartech] ✓ הורד {len(resp3.content):,} bytes")
-            return resp3.content, filename
-        else:
-            print(f"[Bartech] הורדה נכשלה: {resp3.status_code}")
-            return None, None
+    for ep in [f"{api_base}/api/Buildings/GetBuildingFiles",
+               f"{api_base}/newengine/api/Buildings/GetBuildingFiles"]:
+        try:
+            r = page.request.get(ep, params={"buildingId": bid})
+            if not r.ok:
+                continue
+            files = r.json()
+            if not files:
+                continue
+            target = _pick_best_file(files, prefer_oldest)
+            if not target:
+                continue
+            fid = (target.get("id") or target.get("FileId") or target.get("fileId"))
+            fname = target.get("fileName") or target.get("FileName") or "building.pdf"
+            for dl_ep in [f"{api_base}/api/Files/DownloadFile",
+                          f"{api_base}/newengine/api/Files/DownloadFile"]:
+                try:
+                    dr = page.request.get(dl_ep, params={"fileId": fid})
+                    body = dr.body()
+                    if dr.ok and len(body) > 500:
+                        print(f"[Complot] ✓ {fname} ({len(body):,} bytes)")
+                        return body, fname
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[Complot] files API {ep}: {e}")
+    return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tel Aviv scraper
+# BARTECH — ערד
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scrape_tel_aviv(
-    street: str,
-    number: str,
-    prefer_oldest: bool,
-) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    תל אביב — ארכיון הנדסי:
-    GET https://archive-binyan.tel-aviv.gov.il/api/folders/search?street=X&houseNum=Y
-    → רשימת תיקים
-    GET /api/folders/{folderId}/files → רשימת קבצים
-    GET /api/files/{fileId}/download  → PDF
-    """
-    base = "https://archive-binyan.tel-aviv.gov.il"
-    with httpx.Client(headers=HEADERS, timeout=TIMEOUT, follow_redirects=True) as client:
+def _scrape_bartech(api_base, street, number):
+    search_url = f"{api_base}/SearchPermitApplication"
+    print(f"[Bartech] {search_url}")
+    pw, browser = _launch()
+    try:
+        page, ctx = _page(browser)
+        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
 
-        resp = client.get(
-            f"{base}/api/folders/search",
-            params={"street": street, "houseNum": number},
-        )
-        if resp.status_code != 200:
-            print(f"[TelAviv] חיפוש נכשל: {resp.status_code}")
-            return None, None
+        _try_fill(page, [
+            "input[name*='treet']", "input[placeholder*='רחוב']",
+            "input[id*='treet']",
+        ], street)
 
-        folders = resp.json()
-        if not folders:
-            print(f"[TelAviv] לא נמצאו תיקים עבור {street} {number}")
-            return None, None
+        _try_fill(page, [
+            "input[name*='umber']", "input[placeholder*='מספר']",
+            "input[id*='umber']",
+        ], number)
 
-        folder = folders[0]
-        folder_id = folder.get("id") or folder.get("folderId")
-        print(f"[TelAviv] תיק: {folder_id} — {folder.get('address', '')}")
+        _try_click(page, [
+            "button[type='submit']", "input[type='submit']",
+            "button:has-text('חיפוש')", "button:has-text('Search')",
+        ])
+        time.sleep(3)
 
-        resp2 = client.get(f"{base}/api/folders/{folder_id}/files")
-        if resp2.status_code != 200:
-            print(f"[TelAviv] רשימת קבצים נכשלה: {resp2.status_code}")
-            return None, None
+        _try_click(page, ["tr:nth-child(2)", ".result-row:first-child", "tbody tr:first-child td"])
+        time.sleep(2)
 
-        files = resp2.json()
-        if not files:
-            print(f"[TelAviv] לא נמצאו קבצים")
-            return None, None
+        return _download_pdf(page)
+    finally:
+        browser.close()
+        pw.stop()
 
-        target = _pick_best_file(files, prefer_oldest)
-        if not target:
-            target = files[0]
 
-        file_id = target.get("id") or target.get("fileId")
-        filename = target.get("fileName") or target.get("name") or f"telaviv_{folder_id}.pdf"
+# ─────────────────────────────────────────────────────────────────────────────
+# תל אביב
+# ─────────────────────────────────────────────────────────────────────────────
 
-        resp3 = client.get(f"{base}/api/files/{file_id}/download")
-        if resp3.status_code == 200 and len(resp3.content) > 1000:
-            print(f"[TelAviv] ✓ הורד {len(resp3.content):,} bytes")
-            return resp3.content, filename
-        else:
-            print(f"[TelAviv] הורדה נכשלה: {resp3.status_code}")
-            return None, None
+def _scrape_tel_aviv(street, number, prefer_oldest):
+    search_url = "https://archive-binyan.tel-aviv.gov.il/"
+    print(f"[TelAviv] {search_url}")
+    pw, browser = _launch()
+    try:
+        page, ctx = _page(browser)
+        page.goto(search_url, wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        _try_fill(page, [
+            "input[placeholder*='רחוב']", "#street", "input[name='street']",
+        ], street)
+
+        _try_fill(page, [
+            "input[placeholder*='מספר']", "#houseNum", "input[name='houseNum']",
+        ], number)
+
+        _try_click(page, [
+            "button:has-text('חיפוש')", "input[type='submit']",
+            "button[type='submit']",
+        ])
+        time.sleep(3)
+
+        _try_click(page, [
+            ".result-item:first-child", "tr:nth-child(2) td",
+            ".building-result:first-child",
+        ])
+        time.sleep(2)
+
+        return _download_pdf(page)
+    finally:
+        browser.close()
+        pw.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File picker
 # ─────────────────────────────────────────────────────────────────────────────
 
-PRIORITY_KEYWORDS = [
-    "היתר", "גרמושקא", "גרמושקה", "הגשה", "תכנית", "קומה", "חתך",
-    "permit", "plan", "drawing",
-]
-
 def _pick_best_file(files: list, prefer_oldest: bool) -> Optional[dict]:
-    """בוחר את הקובץ הטוב ביותר מרשימה."""
     if not files:
         return None
-
-    # מסנן PDF בלבד
     pdf_files = [
         f for f in files
         if (f.get("fileName") or f.get("name") or "").lower().endswith(".pdf")
         or (f.get("fileType") or f.get("type") or "").lower() == "pdf"
-    ]
-    if not pdf_files:
-        pdf_files = files  # fallback — קח הכל
-
-    # מחפש קבצים עם מילות מפתח בשם
+    ] or files
     priority = [
         f for f in pdf_files
-        if any(
-            kw in (f.get("fileName") or f.get("name") or "").lower()
-            for kw in PRIORITY_KEYWORDS
-        )
+        if any(kw in (f.get("fileName") or f.get("name") or "").lower()
+               for kw in PRIORITY_KEYWORDS)
     ]
-    candidates = priority if priority else pdf_files
+    candidates = priority or pdf_files
 
-    # מיון לפי תאריך
     def get_date(f):
-        for key in ("date", "uploadDate", "createdDate", "fileDate", "Date"):
-            if f.get(key):
-                return str(f[key])
+        for k in ("date", "uploadDate", "createdDate", "fileDate", "Date"):
+            if f.get(k):
+                return str(f[k])
         return ""
 
-    candidates_sorted = sorted(candidates, key=get_date, reverse=not prefer_oldest)
-    return candidates_sorted[0] if candidates_sorted else candidates[0]
+    return sorted(candidates, key=get_date, reverse=not prefer_oldest)[0]
